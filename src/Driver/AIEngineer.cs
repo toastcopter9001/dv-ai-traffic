@@ -3439,7 +3439,11 @@ namespace AITraffic.Driver
 				return;
 			}
 			RailTrack railTrack = CurrentPath.Tracks[CurrentPath.Tracks.Count - 1];
-			if (railTrack == null || (!TrafficScheduler.IsTrackOccupied(railTrack) && !RailGraph.Instance.IsTrackOccupied(railTrack, (_trainCar != null) ? _trainCar.trainset : null) && !SignalRegistry.IsTrackOccupiedByPlayer(railTrack, (_trainCar != null) ? _trainCar.trainset : null) && !_isWaitingOutsideStationThroat))
+			// Only other trains make the destination "occupied". TrafficScheduler.IsTrackOccupied counts every bogie on the track,
+			// including this train's own, so once the train ran onto its platform it looked occupied and the train was rerouted
+			// off it to another station track (e.g. through OWC-A1L onto dead-end OWC-A3I). RailGraph.IsTrackOccupied with our
+			// trainset ignored covers the same bogies and suspended cars, minus ourselves.
+			if (railTrack == null || (!RailGraph.Instance.IsTrackOccupied(railTrack, (_trainCar != null) ? _trainCar.trainset : null) && !SignalRegistry.IsTrackOccupiedByPlayer(railTrack, (_trainCar != null) ? _trainCar.trainset : null) && !_isWaitingOutsideStationThroat))
 			{
 				return;
 			}
