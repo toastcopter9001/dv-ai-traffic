@@ -596,6 +596,75 @@ namespace AITraffic.Driver
 
 		public RailPath CurrentPath { get; set; }
 
+		/// <summary>Why AI Traffic replaced a train's path on its own (as opposed to another mod assigning CurrentPath).</summary>
+		public enum PathChangeKind
+		{
+			/// <summary>Optional: detour around cars blocking the route (TryDynamicObstacleReroute).</summary>
+			ObstacleDetour,
+			/// <summary>Optional: detour after 30 s at a red signal (TryDynamicRedSignalReroute).</summary>
+			RedSignalDetour,
+			/// <summary>Optional: the train gives way on single track by taking a passing loop (TryDynamicPassingReroute).</summary>
+			PassingLoop,
+			/// <summary>Optional: slow yard detour around a red signal (TryDynamicShuntingDetour).</summary>
+			ShuntingDetour,
+			/// <summary>Optional: a reversal shortly ahead on the planned route (HAIRPIN).</summary>
+			Hairpin,
+			/// <summary>Optional: another free track of the destination station (ApproachDestination).</summary>
+			StationTrack,
+			/// <summary>Forced: the train is on a track that isn't on its path (OFF1/OFF2 off-route recovery).</summary>
+			OffRoute,
+			/// <summary>Forced: new route to the destination after backing into a siding to give way, or after
+			/// backing out of a dead-end spur (RecalculateRouteToDestination).</summary>
+			RecalculateToDestination
+		}
+
+		/// <summary>Asked before an optional reroute; return false to keep the current path (the train waits and the
+		/// reroute is retried later, as if no detour had been found). Forced replacements (OffRoute,
+		/// RecalculateToDestination) aren't asked, only reported through <see cref="PathReplaced"/>. A single owner:
+		/// with several delegates combined only the last one's answer counts.</summary>
+		public static Func<AIEngineer, RailPath, PathChangeKind, bool> PathChangeFilter;
+
+		/// <summary>Raised after AI Traffic replaced a train's path on its own: (engineer, old path, new path, kind).</summary>
+		public static event Action<AIEngineer, RailPath, RailPath, PathChangeKind> PathReplaced;
+
+		// Set by the callers of TryDynamicObstacleReroute that reuse it (red-signal detour, passing loop).
+		private PathChangeKind? _obstacleRerouteKind;
+
+		private bool AllowPathChange(RailPath path, PathChangeKind kind)
+		{
+			Func<AIEngineer, RailPath, PathChangeKind, bool> filter = PathChangeFilter;
+			if (filter == null)
+			{
+				return true;
+			}
+			try
+			{
+				return filter(this, path, kind);
+			}
+			catch (Exception ex)
+			{
+				Main.ModEntry?.Logger?.Warning(string.Format("[AITraffic] PathChangeFilter threw for '{0}' ({1}): {2}", LocoId, kind, ex.Message));
+				return true;
+			}
+		}
+
+		private void NotifyPathReplaced(RailPath oldPath, PathChangeKind kind)
+		{
+			Action<AIEngineer, RailPath, RailPath, PathChangeKind> handler = PathReplaced;
+			if (handler == null)
+			{
+				return;
+			}
+			try
+			{
+				handler(this, oldPath, CurrentPath, kind);
+			}
+			catch (Exception ex)
+			{
+				Main.ModEntry?.Logger?.Warning(string.Format("[AITraffic] PathReplaced handler threw for '{0}' ({1}): {2}", LocoId, kind, ex.Message));
+			}
+		}
+
 		public int CurrentPathTrackIndex { get; private set; }
 
 		public float StationDwellDuration { get; set; }
@@ -2280,6 +2349,7 @@ namespace AITraffic.Driver
 							}
 							if (path != null && path.IsValid && path.Tracks != null && path.Tracks.Count > 1)
 							{
+								RailPath oldPath = CurrentPath;
 								CurrentPath = path;
 								CurrentPathTrackIndex = 0;
 								_upcomingTracks.Clear();
@@ -2288,6 +2358,7 @@ namespace AITraffic.Driver
 									_upcomingTracks.Add(CurrentPath.Tracks[i]);
 								}
 								flag2 = true;
+								NotifyPathReplaced(oldPath, PathChangeKind.OffRoute);
 								if (Main.IsDebugLoggingEnabled)
 								{
 									Main.LogDebug(string.Format("[AITraffic] Ambient train '{0}' diverted off route onto '{1}'. Successfully rerouted forward to '{2}' ({3} tracks).", LocoId, railTrack.name, DestinationStationName ?? railTrack2.name, path.Tracks.Count));
@@ -2307,6 +2378,7 @@ namespace AITraffic.Driver
 								}
 								if (path != null && path.IsValid && path.Tracks != null && path.Tracks.Count > 1)
 								{
+									RailPath oldPath = CurrentPath;
 									CurrentPath = path;
 									CurrentPathTrackIndex = 0;
 									_upcomingTracks.Clear();
@@ -2316,6 +2388,7 @@ namespace AITraffic.Driver
 									}
 									flag2 = true;
 									StartInShuntingMode(FindNextGoverningMainSignal(null));
+									NotifyPathReplaced(oldPath, PathChangeKind.OffRoute);
 									if (Main.IsDebugLoggingEnabled)
 									{
 										Main.LogDebug(string.Format("[AITraffic] Ambient train '{0}' diverted off route onto '{1}'. Found detour in shunting mode to '{2}' ({3} tracks).", LocoId, railTrack.name, DestinationStationName ?? railTrack2.name, path.Tracks.Count));
@@ -2583,8 +2656,9 @@ namespace AITraffic.Driver
 							{
 								Main.ModEntry.Logger.Warning(string.Format("[AITraffic] Train '{0}' detected upcoming hairpin loop in planned route on track '{1}'. Recalculating route.", LocoId, railTrack.name));
 							}
-							if (path2 != null && path2.IsValid && path2.Tracks != null && path2.Tracks.Count > 1)
+							if (path2 != null && path2.IsValid && path2.Tracks != null && path2.Tracks.Count > 1 && AllowPathChange(path2, PathChangeKind.Hairpin))
 							{
+								RailPath oldPath = CurrentPath;
 								CurrentPath = path2;
 								CurrentPathTrackIndex = 0;
 								_upcomingTracks.Clear();
@@ -2592,6 +2666,7 @@ namespace AITraffic.Driver
 								{
 									_upcomingTracks.Add(CurrentPath.Tracks[i]);
 								}
+								NotifyPathReplaced(oldPath, PathChangeKind.Hairpin);
 							}
 						}
 						else
@@ -3571,8 +3646,13 @@ namespace AITraffic.Driver
 				}
 			}
 			_stationThroatPollTimer = 30f;
+			if (railTrack4 != null && railPath != null && !AllowPathChange(railPath, PathChangeKind.StationTrack))
+			{
+				return;   // refused: stay on the current path (and don't start waiting outside the throat)
+			}
 			if (railTrack4 != null && railPath != null)
 			{
+				RailPath oldPath = CurrentPath;
 				CurrentPath = railPath;
 				_upcomingTracks.Clear();
 				int num2 = CurrentPath.Tracks.IndexOf(railTrack3);
@@ -3585,6 +3665,7 @@ namespace AITraffic.Driver
 					_upcomingTracks.Add(CurrentPath.Tracks[j]);
 				}
 				DestinationTrackName = railTrack4.name;
+				NotifyPathReplaced(oldPath, PathChangeKind.StationTrack);
 				_isWaitingOutsideStationThroat = false;
 				_isHoldingForCorridor = false;
 				TargetSpeedKmh = 15f;
@@ -3958,6 +4039,12 @@ namespace AITraffic.Driver
 			{
 				return false;
 			}
+			PathChangeKind kind = _obstacleRerouteKind ?? PathChangeKind.ObstacleDetour;
+			if (!AllowPathChange(path, kind))
+			{
+				return false;
+			}
+			RailPath oldPath = CurrentPath;
 			CurrentPath = path;
 			CurrentPathTrackIndex = 0;
 			_upcomingTracks.Clear();
@@ -3965,6 +4052,7 @@ namespace AITraffic.Driver
 			{
 				_upcomingTracks.Add(CurrentPath.Tracks[j]);
 			}
+			NotifyPathReplaced(oldPath, kind);
 			_obstacleTrack = null;
 			DistanceToObstacle = float.PositiveInfinity;
 			_obstacleWaitTimer = 0f;
@@ -4010,7 +4098,16 @@ namespace AITraffic.Driver
 					{
 						continue;
 					}
-					bool flag3 = TryDynamicObstacleReroute(curTrack, railTrack2);
+					bool flag3;
+					_obstacleRerouteKind = PathChangeKind.RedSignalDetour;
+					try
+					{
+						flag3 = TryDynamicObstacleReroute(curTrack, railTrack2);
+					}
+					finally
+					{
+						_obstacleRerouteKind = null;
+					}
 					if (!flag3 && _reroutePending)
 					{
 						return false;
@@ -4207,8 +4304,9 @@ namespace AITraffic.Driver
 						}
 					}
 				}
-				if (flag4)
+				if (flag4 && AllowPathChange(railPath, PathChangeKind.ShuntingDetour))
 				{
+					RailPath oldPath = CurrentPath;
 					CurrentPath = railPath;
 					CurrentPathTrackIndex = num2;
 					_upcomingTracks.Clear();
@@ -4216,6 +4314,7 @@ namespace AITraffic.Driver
 					{
 						_upcomingTracks.Add(CurrentPath.Tracks[j]);
 					}
+					NotifyPathReplaced(oldPath, PathChangeKind.ShuntingDetour);
 					_obstacleTrack = null;
 					DistanceToObstacle = float.PositiveInfinity;
 					_stoppedAtRedTimer = 0f;
@@ -4613,7 +4712,15 @@ namespace AITraffic.Driver
 						{
 							Main.ModEntry.Logger.Log(string.Format("[AITraffic] Dynamic Passing: Yielding train '{0}' adopting passing loop '{1}' to allow through traffic on '{2}'.", LocoId, track.name, railTrack2.name));
 						}
-						return TryDynamicObstacleReroute(curTrack, railTrack2);
+						_obstacleRerouteKind = PathChangeKind.PassingLoop;
+						try
+						{
+							return TryDynamicObstacleReroute(curTrack, railTrack2);
+						}
+						finally
+						{
+							_obstacleRerouteKind = null;
+						}
 					}
 				}
 			}
@@ -5518,6 +5625,7 @@ namespace AITraffic.Driver
 			}
 			if (path != null && path.IsValid && path.Tracks != null && path.Tracks.Count > 1)
 			{
+				RailPath oldPath = CurrentPath;
 				CurrentPath = path;
 				CurrentPathTrackIndex = 0;
 				_ambientLockedReverser = 0f;
@@ -5526,6 +5634,7 @@ namespace AITraffic.Driver
 				{
 					_upcomingTracks.Add(CurrentPath.Tracks[i]);
 				}
+				NotifyPathReplaced(oldPath, PathChangeKind.RecalculateToDestination);
 				return true;
 			}
 			return false;
