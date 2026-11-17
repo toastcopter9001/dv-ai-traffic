@@ -593,11 +593,11 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // 2. Definition properties
-            if (signal.Definition != null && signal.Definition.SelfActsAsDistant)
-            {
-                return false;
-            }
+            // 2. Do NOT exclude Definition.SelfActsAsDistant either: in DVSignals that flag marks a main signal that also
+            // displays the next signal's distant state itself ("In case this signal displays distant state by itself").
+            // It still owns a block and shows stop, and on the default layout most block, entry and exit signals are like
+            // this. Treating them as distant made the block model run past them, so a train reserved and locked through to
+            // the next "real" signal (e.g. from a double-track siding straight to the next station's entry signal).
 
             // 3. Signal name / prefix (DVSignals German pack uses "Ps {0}" format for distant signals / Vorsignale)
             string sigName = signal.NameOverride ?? "";
