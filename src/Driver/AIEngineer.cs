@@ -1733,8 +1733,10 @@ namespace AITraffic.Driver
 			return IsPassingPlaceTrack(track, edge);
 		}
 
-		/// <summary>Shortest track that counts as a passing place. Switch pieces are ~24 m.</summary>
-		private const float MinPassingPlaceLength = 100f;
+		/// <summary>Shortest track that counts as a passing place. RailGraph also pairs things that aren't passing places:
+		/// switch pieces (~24 m) and the legs of a wye where they run side by side (e.g. Road 23 / Road 24 at the T-junction
+		/// east of Road 22B, 134 m). Real loops and double-track pieces seen so far are 450-750 m.</summary>
+		private const float MinPassingPlaceLength = 300f;
 
 		/// <summary>
 		/// A track where two trains can pass: a main-line track with a parallel track (double-track section, either side of
