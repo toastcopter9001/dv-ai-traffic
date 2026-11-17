@@ -1727,16 +1727,39 @@ namespace AITraffic.Driver
 			return false;
 		}
 
-		/// <summary>A main-line track with a parallel track (double-track section, either side of a passing loop) or a
-		/// passing siding; yard tracks don't count.</summary>
 		private static bool IsMultiTrackSectionTrack(RailTrack track)
 		{
 			RailEdge edge = (RailGraph.Instance != null && RailGraph.Instance.IsInitialized) ? RailGraph.Instance.GetEdge(track) : null;
-			if (edge == null || edge.IsYardTrack)
+			return IsPassingPlaceTrack(track, edge);
+		}
+
+		/// <summary>Shortest track that counts as a passing place. Switch pieces are ~24 m.</summary>
+		private const float MinPassingPlaceLength = 100f;
+
+		/// <summary>
+		/// A track where two trains can pass: a main-line track with a parallel track (double-track section, either side of
+		/// a passing loop), a DoubleTrack-mod track, or a passing siding. Never a switch track and never shorter than
+		/// MinPassingPlaceLength: RailGraph's geometric pairing marks the two ~24 m branch pieces of every switch as
+		/// "double track" (paired with each other), which split every single-track corridor at each switch and let a train
+		/// on a switch count as already being in a loop. Yard tracks aren't passing places (they still end a corridor).
+		/// Shared by the single-track corridor builder and the loop reservation deferral.
+		/// </summary>
+		private static bool IsPassingPlaceTrack(RailTrack track, RailEdge edge)
+		{
+			if (track == null || edge == null || edge.IsYardTrack || edge.IsJunctionTrack || track.isJunctionTrack)
 			{
 				return false;
 			}
-			return edge.IsDoubleTrackMainline || Pathfinder.IsPassingOrSidingTrack(edge);
+			float length = (track.curve != null) ? track.curve.length : edge.Length;
+			if (length < MinPassingPlaceLength)
+			{
+				return false;
+			}
+			string name = track.name ?? string.Empty;
+			return edge.IsDoubleTrackMainline
+				|| name.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0
+				|| name.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0
+				|| Pathfinder.IsPassingOrSidingTrack(edge);
 		}
 
 		private Signals.Game.Signal ResolveShuntingSubstitute(Signals.Game.Signal requested)
@@ -4833,9 +4856,10 @@ namespace AITraffic.Driver
 			float num5 = ((TargetDirection >= 0f) ? Mathf.Max(0f, num4 - (float)num3) : Mathf.Max(0f, (float)num3));
 			num2 = num5;
 			RailEdge edge = RailGraph.Instance.GetEdge(railTrack);
-			bool flag2 = (edge != null && edge.IsDoubleTrackMainline) || (railTrack != null && railTrack.name != null && (railTrack.name.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 || railTrack.name.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0));
-			bool flag3 = Pathfinder.IsPassingOrSidingTrack(railTrack);
-			bool flag4 = edge != null && !flag2 && !edge.IsYardTrack && !flag3;
+			// Passing places bound a corridor; switch tracks and short pieces are part of the single track around them.
+			bool flag2 = IsPassingPlaceTrack(railTrack, edge);
+			bool flag3 = false;   // passing sidings are included in flag2
+			bool flag4 = edge != null && !flag2 && !edge.IsYardTrack;
 			if (flag4)
 			{
 				flag = true;
@@ -4850,9 +4874,8 @@ namespace AITraffic.Driver
 					continue;
 				}
 				RailEdge edge2 = RailGraph.Instance.GetEdge(railTrack2);
-				bool flag5 = (edge2 != null && edge2.IsDoubleTrackMainline) || (railTrack2 != null && railTrack2.name != null && (railTrack2.name.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 || railTrack2.name.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0));
-				bool flag6 = Pathfinder.IsPassingOrSidingTrack(railTrack2);
-				if (edge2 != null && !flag5 && !edge2.IsYardTrack && !flag6)
+				bool flag5 = IsPassingPlaceTrack(railTrack2, edge2);
+				if (edge2 != null && !flag5 && !edge2.IsYardTrack)
 				{
 					if (!flag)
 					{
