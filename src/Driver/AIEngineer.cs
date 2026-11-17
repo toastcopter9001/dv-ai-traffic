@@ -1672,11 +1672,74 @@ namespace AITraffic.Driver
 		/// So when a shunting signal has a DV main signal before it on the route, reserve that main signal instead (its
 		/// block covers the shunting signal), provided its whole block lies on our path - a reservation re-aligns the
 		/// block's switches on every update. Otherwise reserve nothing yet. Once the train has passed the main signal the
-		/// shunting signal resolves to itself and is reserved normally. Self-acting-distant main signals count here even
-		/// though SignalRegistry.IsGoverningSignal excludes them; the substitute goes into _reservedDVSignals and the
+		/// shunting signal resolves to itself and is reserved normally. The substitute goes into _reservedDVSignals and the
 		/// desired set like any other route signal, so the normal release logic frees it once passed.
+		///
+		/// Then, outside shunting mode, a signal the train would only reach after entering a double-track section or
+		/// passing loop is not reserved while the train is still on single track (see IsBeyondUnenteredMultiTrackSection).
 		/// </summary>
 		private Signals.Game.Signal ResolveRouteSignalToReserve(Signals.Game.Signal requested)
+		{
+			Signals.Game.Signal target = ResolveShuntingSubstitute(requested);
+			if (target != null && !_isShuntingMode && IsBeyondUnenteredMultiTrackSection(target))
+			{
+				return null;
+			}
+			return target;
+		}
+
+		/// <summary>
+		/// True when the train is on single track and its path enters a double-track section or passing loop before it
+		/// reaches <paramref name="signal"/> (typically the loop's exit signal when there is no entry signal for our
+		/// direction). Reserving that signal from single track claims the section beyond the loop and its exit switch
+		/// before the train is in the loop, so an opposing train can't use the loop to cross. Wait until the train is on
+		/// the multi-track section; the signal is reserved on the next route update after that.
+		/// </summary>
+		private bool IsBeyondUnenteredMultiTrackSection(Signals.Game.Signal signal)
+		{
+			RailTrack current = CurrentTrack;
+			if (current == null || CurrentPath == null || CurrentPath.Tracks == null || CurrentPath.Tracks.Count == 0)
+			{
+				return false;
+			}
+			if (IsMultiTrackSectionTrack(current))
+			{
+				return false;
+			}
+			Signals.Game.Signal root = (signal.Parent != null) ? signal.Parent : signal;
+			int start = Mathf.Clamp(CurrentPathTrackIndex, 0, CurrentPath.Tracks.Count - 1);
+			for (int i = start; i < CurrentPath.Tracks.Count && i < start + 60; i++)
+			{
+				RailTrack t = CurrentPath.Tracks[i];
+				if (t == null)
+				{
+					continue;
+				}
+				if (t != current && IsMultiTrackSectionTrack(t))
+				{
+					return true;   // a double-track section / loop comes first (the signal may stand on it)
+				}
+				if (SignalRegistry.IsSignalOnTrack(t, root))
+				{
+					return false;  // the signal comes first
+				}
+			}
+			return false;
+		}
+
+		/// <summary>A main-line track with a parallel track (double-track section, either side of a passing loop) or a
+		/// passing siding; yard tracks don't count.</summary>
+		private static bool IsMultiTrackSectionTrack(RailTrack track)
+		{
+			RailEdge edge = (RailGraph.Instance != null && RailGraph.Instance.IsInitialized) ? RailGraph.Instance.GetEdge(track) : null;
+			if (edge == null || edge.IsYardTrack)
+			{
+				return false;
+			}
+			return edge.IsDoubleTrackMainline || Pathfinder.IsPassingOrSidingTrack(edge);
+		}
+
+		private Signals.Game.Signal ResolveShuntingSubstitute(Signals.Game.Signal requested)
 		{
 			if (requested == null || _isShuntingMode || _upcomingSignals == null)
 			{
