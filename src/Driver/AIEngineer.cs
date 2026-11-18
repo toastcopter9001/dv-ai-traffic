@@ -365,7 +365,7 @@ namespace AITraffic.Driver
 
 		private readonly HashSet<Signals.Game.Signal> _reservedDVSignals = new HashSet<Signals.Game.Signal>();
 
-		// CRITICAL INVARIANT [WRK-GATE-1]: origin-yard clearance window â€” starts true (main-only reservations), re-armed false at leg start, self-clears on yard exit (D1)
+		// CRITICAL INVARIANT [WRK-GATE-1]: origin-yard clearance window — starts true (main-only reservations), re-armed false at leg start, self-clears on yard exit (D1)
 		private bool _hasClearedOriginYard = true;
 
 		private string _originYardId;
@@ -1710,7 +1710,7 @@ namespace AITraffic.Driver
 			StationaryTimer = 0f;
 			_isWaitingOutsideStationThroat = false;
 			_stationThroatPollTimer = 0f;
-			// D1: re-arm the origin-yard clearance window for this leg (see Â§3.3 D1)
+			// D1: re-arm the origin-yard clearance window for this leg (see §3.3 D1)
 			_hasClearedOriginYard = false;
 			_originYardId = null;
 			if (nextPath != null && nextPath.Tracks != null && nextPath.Tracks.Count > 0 && nextPath.Tracks[0] != null)
@@ -1721,7 +1721,7 @@ namespace AITraffic.Driver
 					_originYardId = s_trackYardIdGetter(originLogicTrack.ID);
 				}
 			}
-			// CS-2: CRITICAL INVARIANT [WRK-10] â€” frame-atomic staging reset on leg assignment
+			// CS-2: CRITICAL INVARIANT [WRK-10] — frame-atomic staging reset on leg assignment
 			ClearWorkerApproachStaging();
 			ClearRightHandRealignState();
 			_isEmergencyStop = false;
@@ -2261,7 +2261,7 @@ namespace AITraffic.Driver
 			{
 				return;
 			}
-			// CRITICAL INVARIANT [AIE-23]: the takeover grace window is decayed HERE â€” the only always-run site that
+			// CRITICAL INVARIANT [AIE-23]: the takeover grace window is decayed HERE — the only always-run site that
 			// both the reverse-protocol fast path (returns at 1832) and the normal path pass through. It must never be
 			// decayed inside UpdatePlayerCoPilotHandover (frozen for the whole manoeuvre) nor in two places at once
 			// (halves the window). Exactly one decay exists in the whole file after this edit.
@@ -2319,7 +2319,7 @@ namespace AITraffic.Driver
 				UpdateStateMachine(deltaTime);
 				// CRITICAL INVARIANT [AIE-22]: never tick the DM3 transmission on a parked or terminal train. The
 				// controller upshifts from gear 1 at 0 km/h (UpshiftKmh == 0.0f) and re-shifts forever against a
-				// zero commanded throttle â€” the mechanical half of the Issue 3 loop.
+				// zero commanded throttle — the mechanical half of the Issue 3 loop.
 				if (_dm3Controller != null && _dm3Controller.IsDM3 && State != EngineState.PlayerCoPilotStandby && State != EngineState.TerminusStop && !_parkedStateLatched)
 				{
 					_dm3Controller.Update(deltaTime);
@@ -3454,7 +3454,7 @@ namespace AITraffic.Driver
 			{
 				ApproachDestination(dt);
 			}
-			// CRITICAL INVARIANT [WRK-10]: worker-approach staging audit â€” only on a terminus approach toe (â‰¤2000 m); never on ambient station holds
+			// CRITICAL INVARIANT [WRK-10]: worker-approach staging audit — only on a terminus approach toe (≤2000 m); never on ambient station holds
 			if (IsWorkerDriven && !IsStationDestination && IsTerminusDestination && (DistanceToDestination <= 2000f || _isWorkerApproachStaging))
 			{
 				AuditWorkerApproachCongestion(dt);
@@ -7335,7 +7335,7 @@ namespace AITraffic.Driver
 			float num = DistanceToObstacle;
 			float corridorHoldDist = _corridorHoldDistance;
 			float switchHoldDist = _switchHoldDistance;
-			// CRITICAL INVARIANT [WRK-10]: graded worker staging stop line â€” clamp the target-approach distance short of the occupied receiving track
+			// CRITICAL INVARIANT [WRK-10]: graded worker staging stop line — clamp the target-approach distance short of the occupied receiving track
 			if (_isWorkerApproachStaging && _workerStagingHasStopLine)
 			{
 				num = Mathf.Min(num, GetWorkerStagingLiveStopDistance());
@@ -8900,7 +8900,7 @@ namespace AITraffic.Driver
 							if (!_parkedStateLatched)
 							{
 								IsPermanentlyStalled = true;
-								// Â§7.3 of the scout report: the ladder and NotifyPermanentStall never wrote to the
+								// §7.3 of the scout report: the ladder and NotifyPermanentStall never wrote to the
 								// logger, which is why Issue 2 could not be diagnosed. This is the missing breadcrumb.
 								if (Main.ModEntry != null)
 								{
@@ -8927,8 +8927,8 @@ namespace AITraffic.Driver
 								_stage2ContinuousSandingTimer += dt;
 							}
 							// CRITICAL INVARIANT [AIE-21]: a rolling, progressing launch is never abandoned for a rollback
-							// just because the sand window expired â€” that transition manufactured the very rollback â†’
-							// run-up â†’ stall chain this SPEC removes.
+							// just because the sand window expired — that transition manufactured the very rollback →
+							// run-up → stall chain this SPEC removes.
 							if (_stage2ContinuousSandingTimer >= 11f && CurrentSpeedKmh < 1f && !_hasMadeProgressSinceStageEntry && num11 >= 0.005f)
 							{
 								_stage2ContinuousSandingTimer = 0f;
@@ -9075,7 +9075,7 @@ namespace AITraffic.Driver
 						bool flag20 = _isWheelSlipping && num13 < 0.2f;
 						bool flag21 = _commandedThrottle > 0.1f;
 						bool flag22 = flag10 && flag17 && CurrentSpeedKmh < 0.5f && flag21;
-						// CRITICAL INVARIANT [AIE-21]: while the DM3 gearbox is busy or brakes are still venting, the stagnation clock is FROZEN â€”
+						// CRITICAL INVARIANT [AIE-21]: while the DM3 gearbox is busy or brakes are still venting, the stagnation clock is FROZEN —
 						// neither incremented nor decayed. Adding a `else` decay branch here would re-introduce the
 						// [AIE-01] slip-grip ping-pong; removing this guard re-introduces the L-020 false stall.
 						if (dm3GearboxBusy || !flag17)
@@ -9110,7 +9110,7 @@ namespace AITraffic.Driver
 								_hillGroundWindowStartPos = _trainCar.transform.position;
 							}
 							// CRITICAL INVARIANT [AIE-21]: every stage entry re-arms the progress latch from the position
-							// the stage actually starts from â€” evidence of a previous stage's launch is NEVER carried
+							// the stage actually starts from — evidence of a previous stage's launch is NEVER carried
 							// over (that carry-over was the "started moving, then declared permanently stuck" bug).
 							_stageEntryPosition = ((_trainCar != null) ? _trainCar.transform.position : Vector3.zero);
 							_hasMadeProgressSinceStageEntry = false;
@@ -9131,7 +9131,7 @@ namespace AITraffic.Driver
 							{
 								// CRITICAL INVARIANT [AIE-22]: a run-up may only be declared failed after
 								// MaxMomentumRunUpAttempts real attempts AND with no progress since the stage began.
-								// Otherwise fall back to a controlled rollback and try again â€” one bad run-up is not a
+								// Otherwise fall back to a controlled rollback and try again — one bad run-up is not a
 								// permanent stall.
 								if (_momentumRunUpAttempts >= MaxMomentumRunUpAttempts && !_hasMadeProgressSinceStageEntry)
 								{
@@ -9355,8 +9355,8 @@ namespace AITraffic.Driver
 				// CRITICAL INVARIANT [AIE-22]: the parked state is written exactly ONCE, by
 				// SecureTrainForTerminalStop(). This case is now a pure command mirror: no per-frame Throttle /
 				// Reverser / Headlights writes (the 0.4f headlight ping-pong against AILocomotiveLighting's red
-				// markers and the Â±1-vs-0 reverser servo were the audible/visual actuation loop of Issue 3).
-				// It also makes EVERY entry into TerminusStop â€” worker, ambient or stall â€” idempotent.
+				// markers and the ±1-vs-0 reverser servo were the audible/visual actuation loop of Issue 3).
+				// It also makes EVERY entry into TerminusStop — worker, ambient or stall — idempotent.
 				if (_parkedStateLatched)
 				{
 					break;
@@ -9516,7 +9516,7 @@ namespace AITraffic.Driver
 		}
 
 		// CRITICAL INVARIANT [AIE-22]: the ONE place a train is put to bed. Idempotent; after the first call
-		// _parkedStateLatched is true and no code path may write a control again (Â§3.4).
+		// _parkedStateLatched is true and no code path may write a control again (§3.4).
 		private void SecureTrainForTerminalStop()
 		{
 			if (_parkedStateLatched)
@@ -9557,7 +9557,7 @@ namespace AITraffic.Driver
 				_trainCar.brakeSystem.SetHandbrakePosition(1f, true);
 			}
 			// CRITICAL INVARIANT [AIE-22]: the ONLY physical lever writes on a parked train, executed once here.
-			// ExecuteControlOutputs() returns immediately while _parkedStateLatched is set (Â§3.4.1), so nothing can
+			// ExecuteControlOutputs() returns immediately while _parkedStateLatched is set (§3.4.1), so nothing can
 			// re-open the throttle/reverser servo loop that produced the audible back-and-forth of Issue 3.
 			if (_controlsOverrider != null)
 			{
@@ -9581,8 +9581,8 @@ namespace AITraffic.Driver
 			}
 		}
 
-		// NOTE: there is deliberately NO "notify WorkerManager of failure" helper here â€” see the boxed rationale in
-		// Â§3.3.1. The engineer stays alive and inert in the parked latch so AILocomotiveLighting keeps the markers.
+		// NOTE: there is deliberately NO "notify WorkerManager of failure" helper here — see the boxed rationale in
+		// §3.3.1. The engineer stays alive and inert in the parked latch so AILocomotiveLighting keeps the markers.
 
 		private void ExecuteControlOutputs(float dt)
 		{
@@ -9598,7 +9598,7 @@ namespace AITraffic.Driver
 			}
 			// CRITICAL INVARIANT [AIE-22]: a parked train is never touched again. Everything below this line writes a
 			// control; SecureTrainForTerminalStop() already performed the single legal write pass. Without this
-			// return the reverser lock (Â±1) at 8371-8374 fought `case TerminusStop`'s 0f every frame, the
+			// return the reverser lock (±1) at 8371-8374 fought `case TerminusStop`'s 0f every frame, the
 			// handbrake else-branch at 8426 released what the secure pass applied, and the servo cycle was audible.
 			if (_parkedStateLatched)
 			{
@@ -10205,7 +10205,7 @@ namespace AITraffic.Driver
 			_copilotStartIndBrake = _currentIndependentBrake;
 			_copilotStartDynBrake = _currentDynamicBrake;
 			_copilotBlendTimer = CoPilotBlendDuration;
-			// CRITICAL INVARIANT [AIE-23]: 3.0 s of grace on resume as well as on hire â€” one constant, one value.
+			// CRITICAL INVARIANT [AIE-23]: 3.0 s of grace on resume as well as on hire — one constant, one value.
 			_copilotTakeoverGraceTimer = CoPilotTakeoverGraceDuration;
 			_isEmergencyStop = false;
 			_holdAtNextLoopRequested = false;
@@ -10240,7 +10240,7 @@ namespace AITraffic.Driver
 			}
 		}
 
-		// ==== Worker lifecycle state (v0.2.9 Â· D1/D2/D3/D4) â€” see GRAVEYARD [AIE-21] [AIE-22] [AIE-23] ====
+		// ==== Worker lifecycle state (v0.2.9 · D1/D2/D3/D4) — see GRAVEYARD [AIE-21] [AIE-22] [AIE-23] ====
 		private const float CoPilotTakeoverGraceDuration = 3.0f;
 		private const float CoPilotTakeoverThreshold = 0.18f;
 		private const float CoPilotLeverPauseDuration = 0.50f;
@@ -10632,7 +10632,7 @@ namespace AITraffic.Driver
 				BrakePID.Reset();
 			}
 			State = EngineState.PlayerCoPilotStandby;
-			// CRITICAL INVARIANT [AIE-23]: standby entry is a state transition, not a rendering event â€” log it once,
+			// CRITICAL INVARIANT [AIE-23]: standby entry is a state transition, not a rendering event — log it once,
 			// with the loco id, so the takeover is visible in Player.log (it was toast-only and therefore invisible).
 			if (Main.ModEntry != null)
 			{
@@ -10943,7 +10943,7 @@ namespace AITraffic.Driver
 			return (CurrentSpeedKmh < 1.5f && num <= 30f) ? 0f : num;
 		}
 
-		// CRITICAL INVARIANT [WRK-GATE-1]: re-evaluate the D1 window each reservation-gate pass; latch true once the consist leaves the origin yard (or the lookup fails â†’ treat as cleared)
+		// CRITICAL INVARIANT [WRK-GATE-1]: re-evaluate the D1 window each reservation-gate pass; latch true once the consist leaves the origin yard (or the lookup fails → treat as cleared)
 		private void UpdateOriginYardClearedLatch()
 		{
 			if (_hasClearedOriginYard)
