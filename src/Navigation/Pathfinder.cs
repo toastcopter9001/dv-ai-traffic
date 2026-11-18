@@ -196,6 +196,18 @@ namespace AITraffic.Navigation
         public HashSet<RailTrack> PlayerOccupiedTracksSnapshot { get; set; }
 
         /// <summary>
+        /// Main-thread snapshot of paired right-hand double-track corridor tracks occupied exclusively by
+        /// actively moving same-direction AI consists (+1/-1 spline polarity) for safe following.
+        /// </summary>
+        public Dictionary<RailTrack, int> SameDirectionMovingAITracksSnapshot { get; set; }
+
+        /// <summary>
+        /// Main-thread snapshot of paired right-hand double-track corridor tracks reserved exclusively by
+        /// actively moving same-direction AI consists (+1/-1 spline polarity).
+        /// </summary>
+        public Dictionary<RailTrack, int> SameDirectionMovingReservedTracksSnapshot { get; set; }
+
+        /// <summary>
         /// Snapshot of player position in world space for proximity checks during A*.
         /// </summary>
         public Vector3 PlayerPosition { get; set; }
@@ -229,6 +241,8 @@ namespace AITraffic.Navigation
             ExcludedTracks = null;
             OccupiedTracksSnapshot = null;
             PlayerOccupiedTracksSnapshot = null;
+            SameDirectionMovingAITracksSnapshot = null;
+            SameDirectionMovingReservedTracksSnapshot = null;
             PlayerPosition = Vector3.zero;
             HasMilitaryLicenseSnapshot = null;
             TurnoutDivergingPenalty = 40f;
@@ -259,6 +273,8 @@ namespace AITraffic.Navigation
                 ExcludedTracks = this.ExcludedTracks != null ? new HashSet<RailTrack>(this.ExcludedTracks) : null,
                 OccupiedTracksSnapshot = this.OccupiedTracksSnapshot,
                 PlayerOccupiedTracksSnapshot = this.PlayerOccupiedTracksSnapshot != null ? new HashSet<RailTrack>(this.PlayerOccupiedTracksSnapshot) : null,
+                SameDirectionMovingAITracksSnapshot = this.SameDirectionMovingAITracksSnapshot,
+                SameDirectionMovingReservedTracksSnapshot = this.SameDirectionMovingReservedTracksSnapshot,
                 PlayerPosition = this.PlayerPosition,
                 HasMilitaryLicenseSnapshot = this.HasMilitaryLicenseSnapshot,
                 TurnoutDivergingPenalty = this.TurnoutDivergingPenalty,
@@ -473,6 +489,17 @@ namespace AITraffic.Navigation
             if (options.OccupiedTracksSnapshot == null && graph != null)
             {
                 options.OccupiedTracksSnapshot = RailGraph.BuildOccupiedTracksSnapshot(options.RequesterTrainset);
+            }
+            if (options.AvoidOccupiedTracks &&
+                (options.SameDirectionMovingAITracksSnapshot == null || options.SameDirectionMovingReservedTracksSnapshot == null))
+            {
+                Dictionary<RailTrack, int> occDirs;
+                Dictionary<RailTrack, int> resDirs;
+                RailGraph.BuildSameDirectionMovingAISnapshots(options.RequesterTrainset, options.Requester, out occDirs, out resDirs);
+                if (options.SameDirectionMovingAITracksSnapshot == null)
+                    options.SameDirectionMovingAITracksSnapshot = occDirs;
+                if (options.SameDirectionMovingReservedTracksSnapshot == null)
+                    options.SameDirectionMovingReservedTracksSnapshot = resDirs;
             }
             if (options.PlayerOccupiedTracksSnapshot == null)
             {
@@ -1010,7 +1037,7 @@ namespace AITraffic.Navigation
             HashSet<RailTrack> occupiedSnapshot = options.OccupiedTracksSnapshot ?? RailGraph.BuildOccupiedTracksSnapshot(options.RequesterTrainset);
 
             float startG = initialEdge != null ? initialEdge.Length : 0f;
-            float startH = Vector3.Distance(startNode.Position, targetPosition);
+            float startH = Vector3.Distance(startNode.Position, targetPosition) * 0.85f;
             var startSearchNode = new SearchNode
             {
                 Node = startNode,
@@ -1128,7 +1155,7 @@ namespace AITraffic.Navigation
 
                     nodeBestCost[nextKey] = tentativeGScore;
 
-                    float hScore = Vector3.Distance(nextNode.Position, targetPosition);
+                    float hScore = Vector3.Distance(nextNode.Position, targetPosition) * 0.85f;
                     var nextSearchNode = new SearchNode
                     {
                         Node = nextNode,
@@ -1240,8 +1267,20 @@ namespace AITraffic.Navigation
             // Check if track is occupied by requester's own train cars (O(1))
             bool isOccupiedByRequester = (requesterTracks != null && requesterTracks.Contains(edge.Track));
 
+            // CRITICAL INVARIANT [RGR-12]: On verified paired right-hand double-track corridors, allow following
+            // same-direction healthy AI traffic and red-signal-waiting/moving player traffic (+150f bias) instead of crossing
+            // onto wrong-way left track, while preserving [RGR-06] hard avoidance for stalled AI, parked cars, and stopped non-signal player trains.
+            bool edgeForwardDir = (edge != null && edge.IsForward(fromNode, toNode));
+            bool isRightHandCorridorFollow = (edge != null &&
+                                              edge.IsDoubleTrackMainline &&
+                                              edge.ParallelEdge != null &&
+                                              !edge.IsIndustrialYardOrStorageTrack &&
+                                              edge.IsRightHandInDirection(edgeForwardDir));
+            int traversalDirSign = edgeForwardDir ? 1 : -1;
+            bool followedSameDirectionAI = false;
+
             // Occupancy checks:
-            // Intermediate tracks that are physically occupied MUST NEVER be chosen.
+            // Intermediate tracks that are physically occupied MUST NEVER be chosen (except verified right-hand corridor following).
             if (options.AvoidOccupiedTracks && !isStartOrDest && !isOccupiedByRequester)
             {
                 bool isOccupied = (occupiedSnapshot != null)
@@ -1250,12 +1289,25 @@ namespace AITraffic.Navigation
 
                 if (isOccupied)
                 {
-                    if (options.StrictlyAvoidOccupied)
-                        return false;
+                    int occDir;
+                    bool allowFollowing = isRightHandCorridorFollow &&
+                                          options.SameDirectionMovingAITracksSnapshot != null &&
+                                          options.SameDirectionMovingAITracksSnapshot.TryGetValue(edge.Track, out occDir) &&
+                                          occDir == traversalDirSign;
+                    if (allowFollowing)
+                    {
+                        followedSameDirectionAI = true;
+                        cost += 150f;
+                    }
+                    else
+                    {
+                        if (options.StrictlyAvoidOccupied)
+                            return false;
 
-                    // Insurmountable penalty (+10,000,000m) to guarantee an occupied track is NEVER chosen
-                    // over an empty siding or bypass track
-                    cost += options.OccupiedTrackPenalty;
+                        // Insurmountable penalty (+10,000,000m) to guarantee an occupied track is NEVER chosen
+                        // over an empty siding or bypass track
+                        cost += options.OccupiedTrackPenalty;
+                    }
                 }
             }
 
@@ -1265,20 +1317,34 @@ namespace AITraffic.Navigation
                 bool isReservedByOther = _graph.IsTrackReservedByOther(edge.Track, options.Requester);
                 if (isReservedByOther)
                 {
-                    if (options.StrictlyAvoidReserved)
-                        return false;
+                    int resDir;
+                    bool allowReservedFollowing = isRightHandCorridorFollow &&
+                                                  options.SameDirectionMovingReservedTracksSnapshot != null &&
+                                                  options.SameDirectionMovingReservedTracksSnapshot.TryGetValue(edge.Track, out resDir) &&
+                                                  resDir == traversalDirSign;
+                    if (allowReservedFollowing)
+                    {
+                        if (!followedSameDirectionAI)
+                            cost += 150f;
+                    }
+                    else
+                    {
+                        if (options.StrictlyAvoidReserved)
+                            return false;
 
-                    cost += options.ReservedTrackPenalty;
+                        cost += options.ReservedTrackPenalty;
+                    }
                 }
             }
 
-            // Direct Player Track Occupancy Avoidance (never applies to start/dest, requester's own train, or AI workers)
+            // Direct Player Track Occupancy Avoidance (never applies to start/dest, requester's own train, AI workers,
+            // or verified right-hand corridor queueing behind a moving/red-signal-waiting player train).
             var eng = options.Requester as AITraffic.Driver.AIEngineer;
             bool isWorkerOrPlayerLoco = options.RequesterTrainset != null ||
                                         options.Requester is TrainCar ||
                                         (eng != null && eng.IsWorkerDriven);
 
-            if (options.PreventPlayerOvertake && !isWorkerOrPlayerLoco && !isStartOrDest && !isOccupiedByRequester)
+            if (options.PreventPlayerOvertake && !followedSameDirectionAI && !isWorkerOrPlayerLoco && !isStartOrDest && !isOccupiedByRequester)
             {
                 bool isPlayerTrack = false;
                 if (options.PlayerOccupiedTracksSnapshot != null)
@@ -1313,8 +1379,9 @@ namespace AITraffic.Navigation
 
             // CRITICAL INVARIANT [RGR-07]: Universal Right-Hand Running (Rechtsfahrgebot) corridor state.
             bool hasParallelCorridor = (edge != null && edge.IsDoubleTrackMainline && edge.ParallelEdge != null && !edge.IsIndustrialYardOrStorageTrack);
-            bool isRightHandCorridorTrack = hasParallelCorridor && (edge.IsForward(fromNode, toNode) == edge.PreferredForward);
-            bool isLeftHandCorridorTrack = hasParallelCorridor && (edge.IsForward(fromNode, toNode) != edge.PreferredForward);
+            bool isRightHandCorridorTrack = hasParallelCorridor && edge.IsRightHandInDirection(edgeForwardDir);
+            bool isLeftHandCorridorTrack = hasParallelCorridor && !isRightHandCorridorTrack;
+            bool isCenterMultiTrackLane = isLeftHandCorridorTrack && (edge.GetParallelTracksOnLeft(edgeForwardDir) > 0);
 
             // Diverging Split & Lateral Track Geometry Analysis:
             // CRITICAL INVARIANT [RGR-07]: Evaluate precomputed 18m lookahead directions (GetLookaheadDirection)
@@ -1502,7 +1569,7 @@ namespace AITraffic.Navigation
             }
 
             // Prevent AI trains from taking passing sidings/loops to overtake the player in the same corridor
-            if (options.PreventPlayerOvertake && options.Requester is AITraffic.Driver.AIEngineer && !isStartOrDest && !isApproachingDest)
+            if (options.PreventPlayerOvertake && options.Requester is AITraffic.Driver.AIEngineer && !isStartOrDest && !isApproachingDest && !isRightHandCorridorTrack && !isRightHandDivergingBranch)
             {
                 if (isPassingLoop)
                 {
@@ -1541,17 +1608,14 @@ namespace AITraffic.Navigation
                 isRightHandCorridorTrack;
 
             var state = new { Forward = incomingEdge != null && incomingEdge.ToNode == fromNode };
-            bool wasOnRightHandCorridor = (incomingEdge != null &&
-                                           incomingEdge.IsDoubleTrackMainline &&
-                                           incomingEdge.ParallelEdge != null &&
-                                           !incomingEdge.IsIndustrialYardOrStorageTrack &&
-                                           incomingEdge.IsRightHandInDirection(state.Forward));
+            bool incomingHasParallel = (incomingEdge != null &&
+                                        incomingEdge.IsDoubleTrackMainline &&
+                                        incomingEdge.ParallelEdge != null &&
+                                        !incomingEdge.IsIndustrialYardOrStorageTrack);
+            bool wasOnRightHandCorridor = incomingHasParallel && incomingEdge.IsRightHandInDirection(state.Forward);
+            bool wasOnLeftHandCorridor = incomingHasParallel && !incomingEdge.IsRightHandInDirection(state.Forward);
 
-            bool isCrossover = (trackName.IndexOf("CX", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                trackName.IndexOf("SX", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                (trackName.IndexOf("DTC-", StringComparison.OrdinalIgnoreCase) >= 0 && trackName.IndexOf("[track through]", StringComparison.OrdinalIgnoreCase) < 0) ||
-                                trackName.IndexOf("Cross", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                trackName.IndexOf("Xing", StringComparison.OrdinalIgnoreCase) >= 0);
+            bool isCrossover = IsCrossoverName(trackName);
 
             if (!isCrossover && incomingEdge != null && incomingEdge.IsDoubleTrackMainline && edge.IsDoubleTrackMainline)
             {
@@ -1565,7 +1629,14 @@ namespace AITraffic.Navigation
             float effectiveWrongDirFlatPenalty = Mathf.Max(options.WrongDirectionFlatPenalty, 5000f);
             float effectiveWrongDirMultiplier = Mathf.Max(options.WrongDirectionMultiplier, 2.0f);
 
-            if (isCrossover)
+            // Crossing Left -> Right (or entering a right-returning crossover from non-right) onto a verified right-hand corridor pays 0 crossover penalty
+            // so left-running trains take the first clear crossover back to the right-hand track; Right -> Left and non-recovery crossovers pay full penalty.
+            bool isRecoveryLeftToRightCrossover = isCrossover &&
+                                                  !wasOnRightHandCorridor &&
+                                                  (wasOnLeftHandCorridor || isRightHandDivergingBranch || (incomingEdge != null && IsCrossoverName(incomingEdge.TrackName)) || !incomingHasParallel) &&
+                                                  DoesCrossoverExitToRightHandCorridor(edge, fromNode);
+
+            if (isCrossover && !isRecoveryLeftToRightCrossover)
             {
                 cost += effectiveCrossoverPenalty;
             }
@@ -1580,7 +1651,7 @@ namespace AITraffic.Navigation
             if (fromNode.Junction != null && requiredBranch > 0)
             {
                 // Zero out turnout diverging penalty when aligning onto the preferred right-hand track outside stations
-                if (!alignsToRightHandTrack)
+                if (!alignsToRightHandTrack && !isRecoveryLeftToRightCrossover)
                 {
                     cost += options.TurnoutDivergingPenalty;
                 }
@@ -1598,32 +1669,29 @@ namespace AITraffic.Navigation
                 cost += leftPenalty;
             }
 
-            // Double track & parallel passing loop wrong-way running penalty (non-negative) [RGR-07]
-            if (edge.IsDoubleTrackMainline && edge.ParallelEdge != null)
+            // Double track & parallel passing loop wrong-way / center-lane running penalty (non-negative) [RGR-07]
+            if (hasParallelCorridor && !isRightHandCorridorTrack)
             {
-                bool traversingForward = edge.IsForward(fromNode, toNode);
-                bool isCorrectDirection = (traversingForward == edge.PreferredForward);
+                if (!options.AllowWrongDirection && !isCenterMultiTrackLane)
+                    return false;
 
-                if (!isCorrectDirection)
+                // CRITICAL INVARIANT [RGR-07]: Do not re-charge a duplicate flat WrongDirectionFlatPenalty when continuing straight
+                // along the exact same ParallelEdge corridor from incomingEdge or initialEdge within the origin departure throat,
+                // preventing A* from fleeing a straight departure track onto an unpaired outer loop.
+                bool isContinuingSameParallelCorridor = !isLeftHandDivergingBranch && !isCrossover &&
+                    ((incomingEdge != null && incomingEdge.ParallelEdge == edge.ParallelEdge) ||
+                     (isLeavingOrigin && initialEdge != null && initialEdge.ParallelEdge == edge.ParallelEdge));
+
+                float flatPen = isCenterMultiTrackLane ? (effectiveWrongDirFlatPenalty * 0.5f) : effectiveWrongDirFlatPenalty;
+                float multPen = isCenterMultiTrackLane ? (effectiveWrongDirMultiplier * 0.5f) : effectiveWrongDirMultiplier;
+
+                if (isContinuingSameParallelCorridor)
                 {
-                    if (!options.AllowWrongDirection)
-                        return false;
-
-                    // CRITICAL INVARIANT [RGR-07]: Do not re-charge a duplicate flat WrongDirectionFlatPenalty when continuing straight
-                    // along the exact same ParallelEdge corridor from incomingEdge or initialEdge within the origin departure throat,
-                    // preventing A* from fleeing a straight departure track onto an unpaired outer loop.
-                    bool isContinuingSameParallelCorridor = !isLeftHandDivergingBranch && !isCrossover &&
-                        ((incomingEdge != null && incomingEdge.ParallelEdge == edge.ParallelEdge) ||
-                         (isLeavingOrigin && initialEdge != null && initialEdge.ParallelEdge == edge.ParallelEdge));
-
-                    if (isContinuingSameParallelCorridor)
-                    {
-                        cost += (baseDistance * effectiveWrongDirMultiplier);
-                    }
-                    else
-                    {
-                        cost += effectiveWrongDirFlatPenalty + (baseDistance * effectiveWrongDirMultiplier);
-                    }
+                    cost += (baseDistance * multPen);
+                }
+                else
+                {
+                    cost += flatPen + (baseDistance * multPen);
                 }
             }
 
@@ -1667,7 +1735,7 @@ namespace AITraffic.Navigation
                     return wantRightHand ? isRight : !isRight;
                 }
 
-                if (!IsShortSwitchEdge(currEdge) || hop == 3 || currTo.IncidentEdges == null)
+                if ((!IsShortSwitchEdge(currEdge) && currEdge.Length > 80f) || hop == 3 || currTo.IncidentEdges == null)
                     return false;
 
                 Vector3 inDir = -currEdge.GetDirection(currTo);
@@ -1698,6 +1766,64 @@ namespace AITraffic.Navigation
                 if (bestCont == null) return false;
                 currFrom = currTo;
                 currEdge = bestCont;
+            }
+
+            return false;
+        }
+
+        // Thread-safe [RGR-03] pure graph check: determines whether traversing crossoverEdge from fromNode
+        // exits forward into a verified right-hand parallel corridor edge within 4 crossover/switch hops.
+        private bool DoesCrossoverExitToRightHandCorridor(RailEdge crossoverEdge, RailNode fromNode)
+        {
+            if (_graph == null || crossoverEdge == null || fromNode == null)
+                return false;
+
+            RailEdge currEdge = crossoverEdge;
+            RailNode currFrom = fromNode;
+
+            for (int hop = 0; hop < 4; hop++)
+            {
+                RailNode currTo = currEdge.GetOtherNode(currFrom);
+                if (currTo == null) return false;
+
+                var cands = _graph.GetTraversableEdges(currTo, currEdge);
+                if (cands == null || cands.Length == 0) return false;
+
+                Vector3 inDir = -currEdge.GetDirection(currTo);
+                inDir.y = 0f;
+                if (inDir.sqrMagnitude > 0.0001f) inDir.Normalize();
+
+                RailEdge nextCrossover = null;
+                float bestCrossoverDot = 0.65f;
+
+                for (int i = 0; i < cands.Length; i++)
+                {
+                    RailEdge cand = cands[i];
+                    if (cand == null || cand == currEdge || cand.IsIndustrialYardOrStorageTrack) continue;
+
+                    Vector3 outDir = cand.GetDirection(currTo);
+                    outDir.y = 0f;
+                    if (outDir.sqrMagnitude > 0.0001f) outDir.Normalize();
+                    float dot = Vector3.Dot(inDir, outDir);
+                    if (dot < 0.65f) continue;
+
+                    bool candIsCrossover = IsCrossoverName(cand.TrackName) || IsShortSwitchEdge(cand);
+                    if (cand.IsDoubleTrackMainline && cand.ParallelEdge != null && !IsCrossoverName(cand.TrackName))
+                    {
+                        bool candFwd = (cand.FromNode == currTo);
+                        return cand.IsRightHandInDirection(candFwd);
+                    }
+
+                    if (candIsCrossover && dot > bestCrossoverDot)
+                    {
+                        bestCrossoverDot = dot;
+                        nextCrossover = cand;
+                    }
+                }
+
+                if (nextCrossover == null) return false;
+                currFrom = currTo;
+                currEdge = nextCrossover;
             }
 
             return false;
@@ -1925,6 +2051,46 @@ namespace AITraffic.Navigation
             return edge.IsGatedMilitaryTrack || IsGatedMilitaryTrack(edge.Track);
         }
 
+        // TrackID.trackType / TrackID.yardId are FIELDS (not properties) on DV.Logic.Job.TrackID; AccessTools.PropertyGetter returns null for both.
+        private static readonly Func<DV.Logic.Job.TrackID, string> s_trackTypeGetter =
+            CreateTrackIdFieldReader("trackType");
+
+        private static readonly Func<DV.Logic.Job.TrackID, string> s_trackYardIdGetter =
+            CreateTrackIdFieldReader("yardId");
+
+        private static Func<DV.Logic.Job.TrackID, string> CreateTrackIdFieldReader(string fieldName)
+        {
+            System.Reflection.FieldInfo field = HarmonyLib.AccessTools.Field(typeof(DV.Logic.Job.TrackID), fieldName);
+            if (field == null)
+            {
+                return delegate(DV.Logic.Job.TrackID id)
+                {
+                    return null;
+                };
+            }
+            System.Linq.Expressions.ParameterExpression param = System.Linq.Expressions.Expression.Parameter(typeof(DV.Logic.Job.TrackID), "id");
+            return System.Linq.Expressions.Expression.Lambda<Func<DV.Logic.Job.TrackID, string>>(System.Linq.Expressions.Expression.Field(param, field), param).Compile();
+        }
+
+        /// <summary>
+        /// Determines whether a given track is a through-track at Farm (FM) that connects across yard boundaries.
+        /// </summary>
+        public static bool IsFarmThroughTrack(RailTrack track)
+        {
+            if (track == null) return false;
+            if (track.inJunction == null || track.outJunction == null) return false;
+            string tName = track.name ?? string.Empty;
+            if (tName.EndsWith("-L]", StringComparison.OrdinalIgnoreCase)) return false;
+            bool isFmTrack = tName.Contains("[FM]") || tName.Contains(" FM ") || tName.Contains("_FM_");
+            var logicTrack = (Main.IsBackgroundThread ? null : AITraffic.Compat.ModCompatManager.GetLogicTrack(track));
+            if (logicTrack?.ID != null)
+            {
+                if (s_trackTypeGetter(logicTrack.ID) == "L") return false;
+                if (s_trackYardIdGetter(logicTrack.ID) == "FM") isFmTrack = true;
+            }
+            return isFmTrack;
+        }
+
         /// <summary>
         /// Determines whether a track is an industrial or station yard storage/shunting track (e.g. [Y]_[OWN]_[A-01-S]).
         /// </summary>
@@ -1948,7 +2114,7 @@ namespace AITraffic.Navigation
             }
 
             // Station central running/bypass lines (ending in [--]) are through-tracks, NOT shunting/storage tracks
-            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
+            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || IsFarmThroughTrack(track))
             {
                 return false;
             }
@@ -2005,6 +2171,15 @@ namespace AITraffic.Navigation
             if (track == null) return false;
             string tName = track.name ?? string.Empty;
 
+            // DoubleTrack mod passing sidings (e.g. "[y]_[doubletrack]_[Siding-8-T]", "[y]_[doubletrack]_[Siding-DT-Donut-Upper-D] 41")
+            // Checked BEFORE rejecting generic "DT-" mainline names so "Siding-DT-..." sidings keep passing-loop classification.
+            if ((tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0) &&
+                tName.IndexOf("Siding", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
             // Mainline [#], DT-, and platform tracks are not sidings
             if (tName.Contains("[#]") ||
                 tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -2015,13 +2190,6 @@ namespace AITraffic.Navigation
                 tName.IndexOf("Pax", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 return false;
-            }
-
-            // DoubleTrack mod passing sidings (e.g. "[y]_[doubletrack]_[Siding-8-T]")
-            if (tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                tName.IndexOf("Siding", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                return true;
             }
 
             // Yard storage, shunting, loading, and transfer tracks are NEVER passing sidings
@@ -2109,7 +2277,7 @@ namespace AITraffic.Navigation
             }
 
             // Station central running/bypass lines (ending in [--]) are through-tracks, NOT avoided tracks
-            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
+            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || IsFarmThroughTrack(track))
             {
                 return false;
             }
@@ -2205,7 +2373,7 @@ namespace AITraffic.Navigation
             }
 
             // Station central running/bypass lines (ending in [--]) are through-tracks, NOT industrial yard tracks
-            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
+            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || IsFarmThroughTrack(track))
             {
                 return false;
             }

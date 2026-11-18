@@ -119,6 +119,22 @@ namespace AITraffic.Navigation
         public bool IsDoubleTrackMainline { get; internal set; }
         public bool PreferredForward { get; internal set; } // True if FromNode -> ToNode is right-hand running
         public RailEdge ParallelEdge { get; internal set; }
+        // CRITICAL INVARIANT [RGR-07] & [RGR-03]: Precomputed directional parallel-lane neighbor counts (main thread only)
+        // distinguishing true rightmost lanes (0) from middle/inner lanes (>=1 on both sides) in 3+ parallel through-track bundles.
+        public byte ParallelTracksOnRightForward { get; internal set; }
+        public byte ParallelTracksOnLeftForward { get; internal set; }
+        public byte ParallelTracksOnRightReverse { get; internal set; }
+        public byte ParallelTracksOnLeftReverse { get; internal set; }
+
+        public byte GetParallelTracksOnRight(bool forward)
+        {
+            return forward ? ParallelTracksOnRightForward : ParallelTracksOnRightReverse;
+        }
+
+        public byte GetParallelTracksOnLeft(bool forward)
+        {
+            return forward ? ParallelTracksOnLeftForward : ParallelTracksOnLeftReverse;
+        }
 
         public byte InBranchIndex { get; internal set; }
         public byte OutBranchIndex { get; internal set; }
@@ -197,6 +213,10 @@ namespace AITraffic.Navigation
 
         public bool IsRightHandInDirection(bool forward)
         {
+            if (ParallelTracksOnRightForward > 0 || ParallelTracksOnRightReverse > 0)
+            {
+                return GetParallelTracksOnRight(forward) == 0;
+            }
             return forward == PreferredForward;
         }
 
@@ -497,20 +517,34 @@ namespace AITraffic.Navigation
         {
             public Vector3 Position;
             public RailNode Node;
-            public PositionNodeEntry(Vector3 pos, RailNode node)
+            public bool IsTurntable;
+            public PositionNodeEntry(Vector3 pos, RailNode node, bool isTurntable)
             {
                 Position = pos;
                 Node = node;
+                IsTurntable = isTurntable;
             }
         }
 
+        private static bool IsTurntableTrackName(string trackName)
+        {
+            if (string.IsNullOrEmpty(trackName)) return false;
+            return trackName.IndexOf("Turntable", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   trackName.IndexOf("[T]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   trackName.EndsWith("-T]", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // CRITICAL INVARIANT [RGR-12]: Use 0.35m endpoint merge threshold for non-turntable tracks so 0.806m-0.906m
+        // diamond crossings (e.g. CWSXCD 24 <-> DT-CWSB 24) never weld into phantom degree-4 nodes, while
+        // preserving 1.2m tolerance when either endpoint belongs to a turntable bridge/pit.
         private void BuildNodesAndEdges(List<RailTrack> allTracks)
         {
             int nodeIdCounter = 1;
             int edgeIdCounter = 1;
 
             var positionToNode = new List<PositionNodeEntry>();
-            const float positionMergeThreshold = 1.2f;
+            const float nonTurntableMergeThreshold = 0.35f;
+            const float turntableMergeThreshold = 1.2f;
 
             for (int tIdx = 0; tIdx < allTracks.Count; tIdx++)
             {
@@ -520,9 +554,10 @@ namespace AITraffic.Navigation
 
                 Vector3 inPos = track.curve[0].position;
                 Vector3 outPos = track.curve.Last().position;
+                bool isTurntable = IsTurntableTrackName(track.name);
 
-                RailNode fromNode = GetOrCreateNode(inPos, track.inJunction, track.inJunction != null ? track.inJunction.name : track.name + "_In", ref nodeIdCounter, positionToNode, positionMergeThreshold);
-                RailNode toNode = GetOrCreateNode(outPos, track.outJunction, track.outJunction != null ? track.outJunction.name : track.name + "_Out", ref nodeIdCounter, positionToNode, positionMergeThreshold);
+                RailNode fromNode = GetOrCreateNode(inPos, track.inJunction, track.inJunction != null ? track.inJunction.name : track.name + "_In", ref nodeIdCounter, positionToNode, isTurntable, nonTurntableMergeThreshold, turntableMergeThreshold);
+                RailNode toNode = GetOrCreateNode(outPos, track.outJunction, track.outJunction != null ? track.outJunction.name : track.name + "_Out", ref nodeIdCounter, positionToNode, isTurntable, nonTurntableMergeThreshold, turntableMergeThreshold);
 
                 var edge = new RailEdge(edgeIdCounter++, track, fromNode, toNode);
                 Edges.Add(edge);
@@ -543,7 +578,9 @@ namespace AITraffic.Navigation
             string namePrefix,
             ref int nodeIdCounter,
             List<PositionNodeEntry> positionToNode,
-            float positionMergeThreshold)
+            bool isTurntable,
+            float nonTurntableMergeThreshold,
+            float turntableMergeThreshold)
         {
             RailNode existingJunctionNode;
             if (junction != null && _junctionToNode.TryGetValue(junction, out existingJunctionNode))
@@ -554,8 +591,14 @@ namespace AITraffic.Navigation
             for (int i = 0; i < positionToNode.Count; i++)
             {
                 var item = positionToNode[i];
-                if (Vector3.Distance(item.Position, pos) <= positionMergeThreshold)
+                float mergeThreshold = (isTurntable || item.IsTurntable) ? turntableMergeThreshold : nonTurntableMergeThreshold;
+                if (Vector3.Distance(item.Position, pos) <= mergeThreshold)
                 {
+                    if (isTurntable && !item.IsTurntable)
+                    {
+                        item.IsTurntable = true;
+                        positionToNode[i] = item;
+                    }
                     if (junction != null)
                     {
                         if (item.Node.Junction == null)
@@ -571,7 +614,7 @@ namespace AITraffic.Navigation
             var newNode = new RailNode(nodeIdCounter++, namePrefix, pos, junction);
             Nodes.Add(newNode);
             _nodesById[newNode.Id] = newNode;
-            positionToNode.Add(new PositionNodeEntry(pos, newNode));
+            positionToNode.Add(new PositionNodeEntry(pos, newNode, isTurntable));
 
             if (junction != null)
             {
@@ -687,7 +730,7 @@ namespace AITraffic.Navigation
                                     edge.IsIndustrialYardOrStorageTrack = false;
                                     edge.IsStrictlyAvoidedThroughTrack = false;
                                 }
-                                else if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || Pathfinder.IsPassingOrSidingTrack(edge.Track))
+                                else if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || Pathfinder.IsPassingOrSidingTrack(edge.Track) || Pathfinder.IsFarmThroughTrack(edge.Track))
                                 {
                                     edge.IsYardTrack = false;
                                 }
@@ -739,7 +782,7 @@ namespace AITraffic.Navigation
                                 edge.IsIndustrialYardOrStorageTrack = false;
                                 edge.IsStrictlyAvoidedThroughTrack = false;
                             }
-                            else if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || Pathfinder.IsPassingOrSidingTrack(edge.Track))
+                            else if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || Pathfinder.IsPassingOrSidingTrack(edge.Track) || Pathfinder.IsFarmThroughTrack(edge.Track))
                             {
                                 edge.IsYardTrack = false;
                             }
@@ -814,6 +857,7 @@ namespace AITraffic.Navigation
                                          (tName.StartsWith("Road ", StringComparison.OrdinalIgnoreCase) ||
                                           tName.StartsWith("[#]", StringComparison.OrdinalIgnoreCase) ||
                                           tName.Contains("[#]") ||
+                                          Pathfinder.IsFarmThroughTrack(edge.Track) ||
                                           IsCrossoverTrackName(tName)) && !isDeadEnd;
                 if (isOpenCountryRoad)
                 {
@@ -964,12 +1008,21 @@ namespace AITraffic.Navigation
                 candidateEdges.Add(edge);
             }
 
-            float[] bestParallelDist = new float[Edges.Count + 1];
-            for (int i = 0; i < bestParallelDist.Length; i++) bestParallelDist[i] = float.MaxValue;
+            int edgeCapacity = Edges.Count + 1;
+            float[] bestLeftDist = new float[edgeCapacity];
+            float[] bestRightDist = new float[edgeCapacity];
+            RailEdge[] bestLeftEdge = new RailEdge[edgeCapacity];
+            RailEdge[] bestRightEdge = new RailEdge[edgeCapacity];
+            for (int i = 0; i < edgeCapacity; i++)
+            {
+                bestLeftDist[i] = float.MaxValue;
+                bestRightDist[i] = float.MaxValue;
+            }
 
             int geomPairedCount = 0;
 
             // Pass 1: Multi-sample local cross-section geometric pairing (3 seeds on edgeShort x 16 samples on edgeLong)
+            // Track left vs right parallel neighbors independently so 3+ parallel through-tracks never flip handedness via closest neighbor.
             for (int i = 0; i < candidateEdges.Count; i++)
             {
                 RailEdge edge1 = candidateEdges[i];
@@ -1065,44 +1118,104 @@ namespace AITraffic.Navigation
                     if (!foundValidSection) continue;
 
                     Vector3 rightNormalShort = Vector3.Cross(Vector3.up, bestTanShort).normalized;
-                    Vector3 crossVec = bestPtLong - bestPtShort;
-                    float lateralOffset = Vector3.Dot(crossVec, rightNormalShort);
-                    if (Mathf.Abs(lateralOffset) < 1.5f) continue;
+                    float lateralFromShort = Vector3.Dot(bestPtLong - bestPtShort, rightNormalShort);
+                    if (Mathf.Abs(lateralFromShort) < 1.5f) continue;
 
-                    float alignDot = Vector3.Dot(bestTanShort, bestTanLong);
-                    // lateralOffset > 0 means edgeLong is to the RIGHT of edgeShort when facing +bestTanShort:
-                    // -> edgeShort is the LEFT track (PreferredForward = false), edgeLong is the RIGHT track.
-                    // lateralOffset < 0 means edgeLong is to the LEFT of edgeShort when facing +bestTanShort:
-                    // -> edgeShort is the RIGHT track (PreferredForward = true), edgeLong is the LEFT track.
-                    bool prefShort = (lateralOffset <= 0f);
-                    bool prefLong = (lateralOffset > 0f) ? (alignDot > 0f) : (alignDot <= 0f);
+                    Vector3 rightNormalLong = Vector3.Cross(Vector3.up, bestTanLong).normalized;
+                    float lateralFromLong = Vector3.Dot(bestPtShort - bestPtLong, rightNormalLong);
+                    if (Mathf.Abs(lateralFromLong) < 1.5f) continue;
 
-                    if (bestPairDist < bestParallelDist[edgeShort.Id])
+                    if (lateralFromShort > 0f)
                     {
-                        if (!edgeShort.IsDoubleTrackMainline) geomPairedCount++;
-                        bestParallelDist[edgeShort.Id] = bestPairDist;
-                        edgeShort.IsDoubleTrackMainline = true;
-                        edgeShort.ParallelEdge = edgeLong;
-                        edgeShort.PreferredForward = prefShort;
+                        if (bestPairDist < bestRightDist[edgeShort.Id])
+                        {
+                            bestRightDist[edgeShort.Id] = bestPairDist;
+                            bestRightEdge[edgeShort.Id] = edgeLong;
+                        }
+                    }
+                    else
+                    {
+                        if (bestPairDist < bestLeftDist[edgeShort.Id])
+                        {
+                            bestLeftDist[edgeShort.Id] = bestPairDist;
+                            bestLeftEdge[edgeShort.Id] = edgeLong;
+                        }
                     }
 
-                    if (bestPairDist < bestParallelDist[edgeLong.Id])
+                    bool substantialForLong = (edgeShort.Length >= edgeLong.Length * 0.40f) || (edgeLong.Length <= 200.0f);
+                    if (lateralFromLong > 0f)
                     {
-                        if (!edgeLong.IsDoubleTrackMainline) geomPairedCount++;
-                        bestParallelDist[edgeLong.Id] = bestPairDist;
-                        edgeLong.IsDoubleTrackMainline = true;
-                        edgeLong.ParallelEdge = edgeShort;
-                        edgeLong.PreferredForward = prefLong;
+                        if ((substantialForLong || bestLeftEdge[edgeLong.Id] == null) && bestPairDist < bestRightDist[edgeLong.Id])
+                        {
+                            bestRightDist[edgeLong.Id] = bestPairDist;
+                            bestRightEdge[edgeLong.Id] = edgeShort;
+                        }
                     }
-                    else if (!edgeLong.IsDoubleTrackMainline)
+                    else
                     {
-                        // Symmetric 1-to-N handshake guarantee
-                        geomPairedCount++;
-                        edgeLong.IsDoubleTrackMainline = true;
-                        edgeLong.ParallelEdge = edgeShort;
-                        edgeLong.PreferredForward = prefLong;
+                        if ((substantialForLong || bestRightEdge[edgeLong.Id] == null) && bestPairDist < bestLeftDist[edgeLong.Id])
+                        {
+                            bestLeftDist[edgeLong.Id] = bestPairDist;
+                            bestLeftEdge[edgeLong.Id] = edgeShort;
+                        }
                     }
                 }
+            }
+
+            // Resolve Pass 1 right/left lane handedness for all matched edges.
+            for (int i = 0; i < candidateEdges.Count; i++)
+            {
+                RailEdge edge = candidateEdges[i];
+                RailEdge leftNeighbor = bestLeftEdge[edge.Id];
+                RailEdge rightNeighbor = bestRightEdge[edge.Id];
+                if (leftNeighbor == null && rightNeighbor == null)
+                    continue;
+
+                if (leftNeighbor != null && rightNeighbor != null)
+                {
+                    if (edge.Length > 200.0f)
+                    {
+                        if (leftNeighbor.Length < edge.Length * 0.40f && rightNeighbor.Length >= edge.Length * 0.40f)
+                            leftNeighbor = null;
+                        else if (rightNeighbor.Length < edge.Length * 0.40f && leftNeighbor.Length >= edge.Length * 0.40f)
+                            rightNeighbor = null;
+                    }
+                }
+
+                bool wasPaired = (edge.ParallelEdge != null);
+                edge.IsDoubleTrackMainline = true;
+
+                if (leftNeighbor != null && rightNeighbor == null)
+                {
+                    edge.ParallelEdge = leftNeighbor;
+                    edge.PreferredForward = true;
+                    edge.ParallelTracksOnRightForward = 0;
+                    edge.ParallelTracksOnLeftForward = 1;
+                    edge.ParallelTracksOnRightReverse = 1;
+                    edge.ParallelTracksOnLeftReverse = 0;
+                }
+                else if (rightNeighbor != null && leftNeighbor == null)
+                {
+                    edge.ParallelEdge = rightNeighbor;
+                    edge.PreferredForward = false;
+                    edge.ParallelTracksOnRightForward = 1;
+                    edge.ParallelTracksOnLeftForward = 0;
+                    edge.ParallelTracksOnRightReverse = 0;
+                    edge.ParallelTracksOnLeftReverse = 1;
+                }
+                else
+                {
+                    // Center lane in a 3+ parallel through-track bundle: never rightmost in either direction.
+                    bool leftCloser = (bestLeftDist[edge.Id] <= bestRightDist[edge.Id]);
+                    edge.ParallelEdge = leftCloser ? leftNeighbor : rightNeighbor;
+                    edge.PreferredForward = leftCloser;
+                    edge.ParallelTracksOnRightForward = 1;
+                    edge.ParallelTracksOnLeftForward = 1;
+                    edge.ParallelTracksOnRightReverse = 1;
+                    edge.ParallelTracksOnLeftReverse = 1;
+                }
+
+                if (!wasPaired) geomPairedCount++;
             }
 
             // Pass 2A: Propagate corridor pairing and directional handedness across degree-2 nodes and conflict-free colinear switch leads
@@ -1133,16 +1246,114 @@ namespace AITraffic.Navigation
             return !string.IsNullOrEmpty(tName) && tName.StartsWith("[track ", StringComparison.OrdinalIgnoreCase);
         }
 
+        private static bool IsDivergingSwitchEdge(RailEdge edge)
+        {
+            if (edge == null || string.IsNullOrEmpty(edge.TrackName)) return false;
+            return edge.TrackName.IndexOf("[track diverging]", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool IsLeadNearParallelEdgeOrContinuation(RailEdge leadEdge, RailEdge oppEdge, RailNode sharedNode, RailEdge pairedEdge, bool isDegree2, float maxLongitudinalStagger, float maxParallelDistance)
+        {
+            if (leadEdge == null || oppEdge == null || oppEdge.Track == null || oppEdge.Track.curve == null)
+                return false;
+
+            Vector3 leadMid = leadEdge.GetMidPoint();
+
+            RailEdge probeEdge = oppEdge;
+            RailNode prevOppNode = null;
+            // Probe oppEdge and up to 2 colinear non-crossover continuation edges beyond oppEdge so symmetric crossovers pair cleanly.
+            for (int hop = 0; hop <= 2 && probeEdge != null; hop++)
+            {
+                if (probeEdge.Track != null && probeEdge.Track.curve != null)
+                {
+                    float spanOpp = probeEdge.Length * 0.5f;
+                    float bestDistSq = float.MaxValue;
+                    for (int s = 1; s <= 7; s++)
+                    {
+                        float testSpan = probeEdge.Length * (s * 0.125f);
+                        float dSq = (probeEdge.GetPointAtSpan(testSpan) - leadMid).sqrMagnitude;
+                        if (dSq < bestDistSq)
+                        {
+                            bestDistSq = dSq;
+                            spanOpp = testSpan;
+                        }
+                    }
+                    for (int iter = 0; iter < 2; iter++)
+                    {
+                        Vector3 pOpp = probeEdge.GetPointAtSpan(spanOpp);
+                        Vector3 tOpp = probeEdge.GetTangentAtSpan(spanOpp);
+                        spanOpp = Mathf.Clamp(spanOpp + Vector3.Dot(leadMid - pOpp, tOpp), 0f, probeEdge.Length);
+                    }
+                    Vector3 refOpp = probeEdge.GetPointAtSpan(spanOpp);
+                    Vector3 tanOpp = probeEdge.GetTangentAtSpan(spanOpp);
+                    Vector3 delta = refOpp - leadMid;
+                    float stagger = Mathf.Abs(Vector3.Dot(delta, tanOpp));
+                    float hDist = new Vector2(delta.x, delta.z).magnitude;
+                    if (stagger <= maxLongitudinalStagger && hDist >= 1.0f && hDist <= maxParallelDistance)
+                    {
+                        return true;
+                    }
+                    if (hop == 0 && isDegree2 && Vector3.Distance(leadMid, probeEdge.GetMidPoint()) <= (probeEdge.Length * 0.5f + 25f))
+                    {
+                        return true;
+                    }
+                }
+
+                // Advance probeEdge toward leadMid along oppEdge's matching endpoint node.
+                RailNode advNode = null;
+                if (hop == 0)
+                {
+                    if (probeEdge.FromNode != null && probeEdge.ToNode != null)
+                    {
+                        float dFrom = (probeEdge.FromNode.Position - leadMid).sqrMagnitude;
+                        float dTo = (probeEdge.ToNode.Position - leadMid).sqrMagnitude;
+                        advNode = (dTo <= dFrom) ? probeEdge.ToNode : probeEdge.FromNode;
+                    }
+                }
+                else
+                {
+                    advNode = probeEdge.GetOtherNode(prevOppNode);
+                }
+                if (advNode == null || advNode.IncidentEdges == null) break;
+
+                Vector3 inDir = -probeEdge.GetDirection(advNode);
+                inDir.y = 0f;
+                if (inDir.sqrMagnitude > 0.0001f) inDir.Normalize();
+
+                RailEdge nextProbe = null;
+                float bestAlign = 0.90f;
+                for (int e = 0; e < advNode.IncidentEdges.Count; e++)
+                {
+                    RailEdge cand = advNode.IncidentEdges[e];
+                    if (cand == null || cand == probeEdge || cand == pairedEdge || cand == leadEdge) continue;
+                    if (IsCrossoverTrackName(cand.TrackDisplayName) || IsDivergingSwitchEdge(cand)) continue;
+                    Vector3 outDir = cand.GetDirection(advNode);
+                    outDir.y = 0f;
+                    if (outDir.sqrMagnitude > 0.0001f) outDir.Normalize();
+                    float dot = Vector3.Dot(inDir, outDir);
+                    if (dot >= bestAlign)
+                    {
+                        bestAlign = dot;
+                        nextProbe = cand;
+                    }
+                }
+                prevOppNode = advNode;
+                probeEdge = nextProbe;
+            }
+
+            return false;
+        }
+
         private void PropagateColinearCorridorLeads(float maxLongitudinalStagger, float maxParallelDistance)
         {
-            for (int pass = 0; pass < 2; pass++)
+            for (int pass = 0; pass < 4; pass++)
             {
                 for (int i = 0; i < Edges.Count; i++)
                 {
                     var pairedEdge = Edges[i];
                     if (pairedEdge == null || !pairedEdge.IsDoubleTrackMainline || pairedEdge.ParallelEdge == null)
                         continue;
-                    if (IsShortSwitchTrackEdge(pairedEdge) || IsShortSwitchTrackEdge(pairedEdge.ParallelEdge))
+                    if (IsDivergingSwitchEdge(pairedEdge) || IsDivergingSwitchEdge(pairedEdge.ParallelEdge))
                         continue;
 
                     RailNode[] endpoints = new RailNode[] { pairedEdge.FromNode, pairedEdge.ToNode };
@@ -1178,7 +1389,7 @@ namespace AITraffic.Navigation
                                     continue;
 
                                 string cName = candEdge.TrackDisplayName;
-                                if (IsCrossoverTrackName(cName))
+                                if (IsCrossoverTrackName(cName) || IsDivergingSwitchEdge(candEdge))
                                     continue;
 
                                 Vector3 departDir = candEdge.GetDirection(sharedNode);
@@ -1201,15 +1412,16 @@ namespace AITraffic.Navigation
 
                         if (leadEdge == null || leadEdge.ParallelEdge != null || leadEdge.IsStrictlyAvoidedThroughTrack || leadEdge.Length > 150f)
                             continue;
+                        if (IsCrossoverTrackName(leadEdge.TrackDisplayName) || IsDivergingSwitchEdge(leadEdge))
+                            continue;
                         if (Pathfinder.IsIndustrialYardOrStorageTrack(leadEdge.Track))
                             continue;
 
                         bool rightFlowsIntoShared = (pairedEdge.ToNode == sharedNode) ? pairedEdge.PreferredForward : !pairedEdge.PreferredForward;
                         RailNode farNode = leadEdge.GetOtherNode(sharedNode);
 
-                        // If leadEdge is a junction switch track ([track through] / [track diverging]), ensure its far end
-                        // does not connect directly into the opposing parallel track (crossover) or conflict with another corridor's handedness.
-                        if (IsShortSwitchTrackEdge(leadEdge) && farNode != null && farNode.IncidentEdges != null)
+                        // Ensure leadEdge's far end does not connect directly into the opposing parallel track (crossover) or conflict with another corridor's handedness.
+                        if (farNode != null && farNode.IncidentEdges != null)
                         {
                             bool isCrossoverOrConflicting = false;
                             Vector3 leadArriveFar = -leadEdge.GetDirection(farNode);
@@ -1235,7 +1447,9 @@ namespace AITraffic.Navigation
                                     if (Vector3.Dot(leadArriveFar, farDepart) > 0.5f)
                                     {
                                         bool farRightFlowsOut = (farEdge.FromNode == farNode) ? farEdge.PreferredForward : !farEdge.PreferredForward;
-                                        if (farRightFlowsOut != rightFlowsIntoShared)
+                                        bool farSameCenter = (farEdge.ParallelTracksOnRightForward > 0 && farEdge.ParallelTracksOnRightReverse > 0);
+                                        bool pairedSameCenter = (pairedEdge.ParallelTracksOnRightForward > 0 && pairedEdge.ParallelTracksOnRightReverse > 0);
+                                        if (!farSameCenter && !pairedSameCenter && farRightFlowsOut != rightFlowsIntoShared)
                                         {
                                             isCrossoverOrConflicting = true;
                                             break;
@@ -1249,50 +1463,21 @@ namespace AITraffic.Navigation
                         }
 
                         bool connectsToTurnout = (farNode != null && (farNode.IsJunction || (farNode.IncidentEdges != null && farNode.IncidentEdges.Count > 2)));
-                        RailEdge oppEdge = pairedEdge.ParallelEdge;
-                        bool nearParallelCorridor = false;
-
-                        if (oppEdge != null && oppEdge.Track != null && oppEdge.Track.curve != null)
-                        {
-                            Vector3 leadMid = leadEdge.GetMidPoint();
-                            float spanOpp = oppEdge.Length * 0.5f;
-                            float bestDistSq = float.MaxValue;
-                            for (int s = 1; s <= 7; s++)
-                            {
-                                float testSpan = oppEdge.Length * (s * 0.125f);
-                                float dSq = (oppEdge.GetPointAtSpan(testSpan) - leadMid).sqrMagnitude;
-                                if (dSq < bestDistSq)
-                                {
-                                    bestDistSq = dSq;
-                                    spanOpp = testSpan;
-                                }
-                            }
-                            for (int iter = 0; iter < 2; iter++)
-                            {
-                                Vector3 pOpp = oppEdge.GetPointAtSpan(spanOpp);
-                                Vector3 tOpp = oppEdge.GetTangentAtSpan(spanOpp);
-                                spanOpp = Mathf.Clamp(spanOpp + Vector3.Dot(leadMid - pOpp, tOpp), 0f, oppEdge.Length);
-                            }
-                            Vector3 refOpp = oppEdge.GetPointAtSpan(spanOpp);
-                            Vector3 tanOpp = oppEdge.GetTangentAtSpan(spanOpp);
-                            Vector3 delta = refOpp - leadMid;
-                            float stagger = Mathf.Abs(Vector3.Dot(delta, tanOpp));
-                            float hDist = new Vector2(delta.x, delta.z).magnitude;
-                            if (stagger <= maxLongitudinalStagger && hDist >= 1.0f && hDist <= maxParallelDistance)
-                            {
-                                nearParallelCorridor = true;
-                            }
-                            else if (isDegree2 && Vector3.Distance(leadMid, oppEdge.GetMidPoint()) <= (oppEdge.Length * 0.5f + 25f))
-                            {
-                                nearParallelCorridor = true;
-                            }
-                        }
+                        bool nearParallelCorridor = IsLeadNearParallelEdgeOrContinuation(leadEdge, pairedEdge.ParallelEdge, sharedNode, pairedEdge, isDegree2, maxLongitudinalStagger, maxParallelDistance);
 
                         if ((isDegree2 && (connectsToTurnout || nearParallelCorridor)) || (!isDegree2 && nearParallelCorridor))
                         {
                             leadEdge.IsDoubleTrackMainline = true;
                             leadEdge.ParallelEdge = pairedEdge.ParallelEdge;
                             leadEdge.PreferredForward = (leadEdge.FromNode == sharedNode) ? rightFlowsIntoShared : !rightFlowsIntoShared;
+
+                            bool pairedIntoShared = (pairedEdge.ToNode == sharedNode);
+                            bool leadOutFromShared = (leadEdge.FromNode == sharedNode);
+                            bool samePolarity = (pairedIntoShared == leadOutFromShared);
+                            leadEdge.ParallelTracksOnRightForward = samePolarity ? pairedEdge.ParallelTracksOnRightForward : pairedEdge.ParallelTracksOnRightReverse;
+                            leadEdge.ParallelTracksOnLeftForward = samePolarity ? pairedEdge.ParallelTracksOnLeftForward : pairedEdge.ParallelTracksOnLeftReverse;
+                            leadEdge.ParallelTracksOnRightReverse = samePolarity ? pairedEdge.ParallelTracksOnRightReverse : pairedEdge.ParallelTracksOnRightForward;
+                            leadEdge.ParallelTracksOnLeftReverse = samePolarity ? pairedEdge.ParallelTracksOnLeftReverse : pairedEdge.ParallelTracksOnLeftForward;
                         }
                     }
                 }
@@ -1430,11 +1615,15 @@ namespace AITraffic.Navigation
                 {
                     RailEdge eR = rightChain[r];
                     bool fwdR = rightChainForward[r];
-                    if (!eR.IsDoubleTrackMainline || eR.ParallelEdge == null)
+                    if (eR.ParallelEdge == null)
                     {
                         eR.IsDoubleTrackMainline = true;
                         eR.ParallelEdge = repLeft;
                         eR.PreferredForward = fwdR; // Traveling along chain (split -> merge) is RIGHT-HAND preferred
+                        eR.ParallelTracksOnRightForward = fwdR ? (byte)0 : (byte)1;
+                        eR.ParallelTracksOnLeftForward = fwdR ? (byte)1 : (byte)0;
+                        eR.ParallelTracksOnRightReverse = fwdR ? (byte)1 : (byte)0;
+                        eR.ParallelTracksOnLeftReverse = fwdR ? (byte)0 : (byte)1;
                         newlyPairedCount++;
                     }
                 }
@@ -1443,11 +1632,15 @@ namespace AITraffic.Navigation
                 {
                     RailEdge eL = leftChain[l];
                     bool fwdL = leftChainForward[l];
-                    if (!eL.IsDoubleTrackMainline || eL.ParallelEdge == null)
+                    if (eL.ParallelEdge == null)
                     {
                         eL.IsDoubleTrackMainline = true;
                         eL.ParallelEdge = repRight;
                         eL.PreferredForward = !fwdL; // Traveling along chain (split -> merge) is LEFT-HAND penalized
+                        eL.ParallelTracksOnRightForward = fwdL ? (byte)1 : (byte)0;
+                        eL.ParallelTracksOnLeftForward = fwdL ? (byte)0 : (byte)1;
+                        eL.ParallelTracksOnRightReverse = fwdL ? (byte)0 : (byte)1;
+                        eL.ParallelTracksOnLeftReverse = fwdL ? (byte)1 : (byte)0;
                         newlyPairedCount++;
                     }
                 }
@@ -1468,8 +1661,8 @@ namespace AITraffic.Navigation
                     if (inEdge == null || inEdge.IsStrictlyAvoidedThroughTrack || inEdge.IsIndustrialYardOrStorageTrack)
                         continue;
 
-                    // Do not treat a turnout on an already-paired double-track mainline as a single-to-double split!
-                    if (inEdge.IsDoubleTrackMainline)
+                    // Do not treat a turnout on an already-paired double-track mainline as a single-to-double split.
+                    if (inEdge.IsDoubleTrackMainline && inEdge.ParallelEdge != null)
                         continue;
 
                     Vector3 inDir = -inEdge.GetDirection(splitNode);
@@ -1478,6 +1671,8 @@ namespace AITraffic.Navigation
                         continue;
                     inDir.Normalize();
                     Vector3 rightNormal = Vector3.Cross(Vector3.up, inDir).normalized;
+
+                    var travFromSplit = ComputeTraversableEdgesInternal(splitNode, inEdge);
 
                     RailEdge rightStart = null;
                     RailEdge leftStart = null;
@@ -1489,6 +1684,10 @@ namespace AITraffic.Navigation
                     {
                         RailEdge cand = splitNode.IncidentEdges[b];
                         if (cand == null || cand == inEdge || cand.IsStrictlyAvoidedThroughTrack || cand.IsIndustrialYardOrStorageTrack)
+                            continue;
+                        if (IsCrossoverTrackName(cand.TrackDisplayName))
+                            continue;
+                        if (travFromSplit != null && travFromSplit.Count > 0 && !travFromSplit.Contains(cand))
                             continue;
 
                         Vector3 origDir = cand.GetDirection(splitNode);
@@ -1550,15 +1749,27 @@ namespace AITraffic.Navigation
                                 matchL = l;
                                 break;
                             }
+                            if (rightChain[r].ParallelEdge != null && leftChain[l].ParallelEdge != null &&
+                                (rightChain[r].ParallelEdge == leftChain[l] || leftChain[l].ParallelEdge == rightChain[r]))
+                            {
+                                bool rightConsistent = rightChain[r].IsRightHandInDirection(rightChainForward[r]);
+                                bool leftConsistent = leftChain[l].IsRightHandInDirection(!leftChainForward[l]);
+                                if (rightConsistent && leftConsistent)
+                                {
+                                    matchR = r;
+                                    matchL = l;
+                                    break;
+                                }
+                            }
                         }
                     }
 
                     if (matchR < 0 || matchL < 0)
                         continue;
 
-                    // Verify neither chain is merely merging into an already-paired double-track mainline,
-                    // and select non-switch representative edges for both chains.
-                    bool touchesExistingCorridor = false;
+                    // Verify neither chain merges inconsistently into an unrelated already-paired corridor,
+                    // while permitting chains whose leading switch tracks enter a Pass-1-paired corridor with matching handedness.
+                    bool touchesConflictingCorridor = false;
                     RailEdge repRight = null;
                     RailEdge repLeft = null;
 
@@ -1566,7 +1777,12 @@ namespace AITraffic.Navigation
                     for (int r = 0; r <= matchR; r++)
                     {
                         lenRight += rightChain[r].Length;
-                        if (rightChain[r].IsDoubleTrackMainline) touchesExistingCorridor = true;
+                        if (rightChain[r].ParallelEdge != null)
+                        {
+                            bool atMatchEnd = (r == matchR && leftChain[matchL].ParallelEdge != null);
+                            if (!atMatchEnd || !rightChain[r].IsRightHandInDirection(rightChainForward[r]))
+                                touchesConflictingCorridor = true;
+                        }
                         if (repRight == null && !IsShortSwitchTrackEdge(rightChain[r])) repRight = rightChain[r];
                     }
 
@@ -1574,11 +1790,18 @@ namespace AITraffic.Navigation
                     for (int l = 0; l <= matchL; l++)
                     {
                         lenLeft += leftChain[l].Length;
-                        if (leftChain[l].IsDoubleTrackMainline) touchesExistingCorridor = true;
+                        if (leftChain[l].ParallelEdge != null)
+                        {
+                            bool atMatchEnd = (l == matchL && rightChain[matchR].ParallelEdge != null);
+                            if (!atMatchEnd || !leftChain[l].IsRightHandInDirection(!leftChainForward[l]))
+                                touchesConflictingCorridor = true;
+                        }
                         if (repLeft == null && !IsShortSwitchTrackEdge(leftChain[l])) repLeft = leftChain[l];
                     }
 
-                    if (touchesExistingCorridor || repRight == null || repLeft == null)
+                    if (repRight == null && rightChain.Count > 0) repRight = rightChain[0];
+                    if (repLeft == null && leftChain.Count > 0) repLeft = leftChain[0];
+                    if (touchesConflictingCorridor || repRight == null || repLeft == null)
                         continue;
 
                     if (lenRight > maxChainLength || lenLeft > maxChainLength)
@@ -1592,11 +1815,15 @@ namespace AITraffic.Navigation
                     {
                         RailEdge eR = rightChain[r];
                         bool fwdR = rightChainForward[r];
-                        if (!eR.IsDoubleTrackMainline || eR.ParallelEdge == null)
+                        if (eR.ParallelEdge == null)
                         {
                             eR.IsDoubleTrackMainline = true;
                             eR.ParallelEdge = repLeft;
                             eR.PreferredForward = fwdR;
+                            eR.ParallelTracksOnRightForward = fwdR ? (byte)0 : (byte)1;
+                            eR.ParallelTracksOnLeftForward = fwdR ? (byte)1 : (byte)0;
+                            eR.ParallelTracksOnRightReverse = fwdR ? (byte)1 : (byte)0;
+                            eR.ParallelTracksOnLeftReverse = fwdR ? (byte)0 : (byte)1;
                             newlyPairedCount++;
                         }
                     }
@@ -1605,11 +1832,15 @@ namespace AITraffic.Navigation
                     {
                         RailEdge eL = leftChain[l];
                         bool fwdL = leftChainForward[l];
-                        if (!eL.IsDoubleTrackMainline || eL.ParallelEdge == null)
+                        if (eL.ParallelEdge == null)
                         {
                             eL.IsDoubleTrackMainline = true;
                             eL.ParallelEdge = repRight;
                             eL.PreferredForward = !fwdL;
+                            eL.ParallelTracksOnRightForward = fwdL ? (byte)1 : (byte)0;
+                            eL.ParallelTracksOnLeftForward = fwdL ? (byte)0 : (byte)1;
+                            eL.ParallelTracksOnRightReverse = fwdL ? (byte)0 : (byte)1;
+                            eL.ParallelTracksOnLeftReverse = fwdL ? (byte)1 : (byte)0;
                             newlyPairedCount++;
                         }
                     }
@@ -1636,25 +1867,46 @@ namespace AITraffic.Navigation
             {
                 if (currentNode == null || currentNode.IncidentEdges == null) break;
 
-                Vector3 inDir = -currentEdge.GetDirection(currentNode);
+                Vector3 inOriginDir = -currentEdge.GetDirection(currentNode);
+                inOriginDir.y = 0f;
+                if (inOriginDir.sqrMagnitude > 0.0001f) inOriginDir.Normalize();
+
+                Vector3 inLookDir = -currentEdge.GetLookaheadDirection(currentNode);
+                inLookDir.y = 0f;
+                if (inLookDir.sqrMagnitude > 0.0001f) inLookDir.Normalize();
+
+                var traversableCands = ComputeTraversableEdgesInternal(currentNode, currentEdge);
                 RailEdge bestNext = null;
-                float bestAlign = 0.80f; // Require smooth forward continuation
+                float bestScore = 0.80f;
 
                 for (int idx = 0; idx < currentNode.IncidentEdges.Count; idx++)
                 {
                     RailEdge cand = currentNode.IncidentEdges[idx];
                     if (cand == null || cand == currentEdge) continue;
-                    if (cand.IsIndustrialYardOrStorageTrack) continue;
+                    if (cand.IsIndustrialYardOrStorageTrack || cand.IsStrictlyAvoidedThroughTrack) continue;
+                    if (traversableCands != null && traversableCands.Count > 0 && !traversableCands.Contains(cand)) continue;
 
                     string cName = cand.TrackDisplayName;
                     if (IsCrossoverTrackName(cName)) continue;
 
-                    Vector3 outDir = cand.GetDirection(currentNode);
-                    float align = Vector3.Dot(inDir, outDir);
-                    if (align > bestAlign)
+                    Vector3 outOriginDir = cand.GetDirection(currentNode);
+                    outOriginDir.y = 0f;
+                    if (outOriginDir.sqrMagnitude > 0.0001f) outOriginDir.Normalize();
+                    if (Vector3.Dot(inOriginDir, outOriginDir) < 0.50f) continue;
+
+                    Vector3 outLookDir = cand.GetLookaheadDirection(currentNode);
+                    outLookDir.y = 0f;
+                    if (outLookDir.sqrMagnitude > 0.0001f) outLookDir.Normalize();
+
+                    float align = Vector3.Dot(inLookDir, outLookDir);
+                    float tieBonus = 0f;
+                    if (!IsDivergingSwitchEdge(cand)) tieBonus += 0.02f;
+                    if (cand.ParallelEdge != null) tieBonus += 0.01f;
+
+                    float score = align + tieBonus;
+                    if (align >= 0.80f && score > bestScore)
                     {
-                        // Prefer already-paired corridor edges or non-diverging through continuations
-                        bestAlign = align;
+                        bestScore = score;
                         bestNext = cand;
                     }
                 }
@@ -2188,6 +2440,249 @@ namespace AITraffic.Navigation
             return occupied;
         }
 
+        /// <summary>
+        /// Main-thread only ([RGR-03]). Snapshots paired right-hand double-track corridor tracks occupied
+        /// or reserved by healthy same-direction AI consists (moving or signal/throat-waiting, never stalled/parked)
+        /// and moving or red-signal-waiting same-direction player trains, storing spline polarity (+1 FromNode->ToNode,
+        /// -1 ToNode->FromNode). Stalled AI, stopped non-signal player trains, parked cars, and suspended stock
+        /// are tainted and excluded so [RGR-06] hard avoidance permits left-hand bypasses only for real obstructions.
+        /// </summary>
+        // CRITICAL INVARIANT [RGR-12]: Main-thread-only same-direction moving/queueing traffic snapshot for paired-corridor following without relaxing [RGR-06].
+        public static void BuildSameDirectionMovingAISnapshots(
+            Trainset ignoreTrainset,
+            object ignoreRequester,
+            out Dictionary<RailTrack, int> occupiedDirs,
+            out Dictionary<RailTrack, int> reservedDirs)
+        {
+            occupiedDirs = new Dictionary<RailTrack, int>();
+            reservedDirs = new Dictionary<RailTrack, int>();
+
+            try
+            {
+                var tm = AITraffic.Core.TrafficManager.Instance;
+                var engineers = (tm != null) ? tm.ActiveEngineers : null;
+
+                Trainset pTs;
+                Vector3 pPos;
+                float pSpeedKmh;
+                Trainset playerTrainset = SignalRegistry.TryGetPlayerTrainInfo(out pTs, out pPos, out pSpeedKmh) ? pTs : null;
+                if (playerTrainset != null && AITraffic.Compat.ModCompatManager.IsAITrain(playerTrainset))
+                    playerTrainset = null;
+
+                bool playerMovingOrAtRed = false;
+                Vector3 playerQueueDir = Vector3.zero;
+                if (playerTrainset != null && (ignoreTrainset == null || playerTrainset != ignoreTrainset))
+                {
+                    if (pSpeedKmh >= 1.5f)
+                    {
+                        playerMovingOrAtRed = true;
+                    }
+                    else
+                    {
+                        bool unusedPlayerDirMatch;
+                        playerMovingOrAtRed = SignalRegistry.IsPlayerTrainWaitingAtRedSignal(playerTrainset, 250f, Vector3.zero, out unusedPlayerDirMatch, out playerQueueDir);
+                    }
+                }
+
+                var eligibleByTrainset = new Dictionary<Trainset, AITraffic.Driver.AIEngineer>();
+                var eligiblePathDirsByEng = new Dictionary<object, Dictionary<RailTrack, int>>();
+
+                if (engineers != null)
+                {
+                    for (int i = 0; i < engineers.Count; i++)
+                    {
+                        var eng = engineers[i];
+                        if (eng == null || eng.TrainCar == null || eng.TrainCar.trainset == null)
+                            continue;
+
+                        Trainset ts = eng.TrainCar.trainset;
+                        if (ignoreTrainset != null && ts == ignoreTrainset)
+                            continue;
+                        if (ignoreRequester != null && object.ReferenceEquals(eng, ignoreRequester))
+                            continue;
+                        if (playerTrainset != null && ts == playerTrainset)
+                            continue;
+
+                        // Exclude permanently stalled, E-stopped, arrived/holding, or actively reversing AI so they remain bypassable [RGR-06] obstacles.
+                        if (eng.IsPermanentlyStalled ||
+                            eng.IsEmergencyStopped ||
+                            eng.HasArrivedAtDestination ||
+                            eng.IsIntentionalReverseActive)
+                            continue;
+
+                        var st = eng.State;
+                        if (st == AITraffic.Driver.EngineState.TerminusStop ||
+                            st == AITraffic.Driver.EngineState.StationHold)
+                            continue;
+
+                        var path = eng.CurrentPath;
+                        if (path == null || !path.IsValid || path.Edges == null || path.Nodes == null || path.Nodes.Count != path.Edges.Count + 1)
+                            continue;
+
+                        var pathDirs = new Dictionary<RailTrack, int>();
+                        for (int eIdx = 0; eIdx < path.Edges.Count; eIdx++)
+                        {
+                            var e = path.Edges[eIdx];
+                            if (e == null || e.Track == null || !e.IsDoubleTrackMainline || e.ParallelEdge == null || e.IsIndustrialYardOrStorageTrack)
+                                continue;
+
+                            bool fwd = e.IsForward(path.Nodes[eIdx], path.Nodes[eIdx + 1]);
+                            if (!e.IsRightHandInDirection(fwd))
+                                continue;
+
+                            int d = fwd ? 1 : -1;
+                            int existing;
+                            if (pathDirs.TryGetValue(e.Track, out existing))
+                            {
+                                if (existing != d) pathDirs[e.Track] = 0;
+                            }
+                            else
+                            {
+                                pathDirs[e.Track] = d;
+                            }
+                        }
+
+                        if (pathDirs.Count > 0)
+                        {
+                            eligibleByTrainset[ts] = eng;
+                            eligiblePathDirsByEng[eng] = pathDirs;
+                        }
+                    }
+                }
+
+                if (eligibleByTrainset.Count == 0 && !playerMovingOrAtRed)
+                    return;
+
+                var tainted = new HashSet<RailTrack>();
+                AITraffic.Compat.PersistentJobsPatches.AddSuspendedOccupiedTracks(tainted);
+
+                RailGraph graph = s_instance;
+                if (CarSpawner.Instance != null && CarSpawner.Instance.AllCars != null)
+                {
+                    var allCars = CarSpawner.Instance.AllCars;
+                    int carCount = allCars.Count;
+                    for (int c = 0; c < carCount; c++)
+                    {
+                        var car = allCars[c];
+                        if (car == null) continue;
+                        if (ignoreTrainset != null && (car.trainset == ignoreTrainset || (ignoreTrainset.cars != null && ignoreTrainset.cars.Contains(car))))
+                            continue;
+
+                        AITraffic.Driver.AIEngineer carEng = null;
+                        bool isEligibleAI = (car.trainset != null && eligibleByTrainset.TryGetValue(car.trainset, out carEng));
+                        bool isEligiblePlayer = (!isEligibleAI && playerMovingOrAtRed && car.trainset == playerTrainset);
+
+                        for (int bIdx = 0; bIdx < 2; bIdx++)
+                        {
+                            Bogie bogie = (bIdx == 0) ? car.FrontBogie : car.RearBogie;
+                            RailTrack trk = (bogie != null) ? bogie.track : null;
+                            if (trk == null || tainted.Contains(trk))
+                                continue;
+
+                            if (!isEligibleAI && !isEligiblePlayer)
+                            {
+                                tainted.Add(trk);
+                                occupiedDirs.Remove(trk);
+                                continue;
+                            }
+
+                            int dirSign = 0;
+                            if (isEligibleAI)
+                            {
+                                Dictionary<RailTrack, int> engDirs;
+                                if (eligiblePathDirsByEng.TryGetValue(carEng, out engDirs))
+                                {
+                                    engDirs.TryGetValue(trk, out dirSign);
+                                }
+                            }
+
+                            if (dirSign == 0 && trk.curve != null && trk.curve.length > 0.01f && bogie.traveller != null && graph != null)
+                            {
+                                RailEdge re = graph.GetEdge(trk);
+                                if (re != null && re.IsDoubleTrackMainline && re.ParallelEdge != null && !re.IsIndustrialYardOrStorageTrack)
+                                {
+                                    float t = Mathf.Clamp01((float)bogie.traveller.Span / trk.curve.length);
+                                    Vector3 tan = trk.curve.GetTangentAt(t);
+                                    tan.y = 0f;
+                                    if (tan.sqrMagnitude > 0.0001f)
+                                    {
+                                        if (car.rb != null && car.rb.velocity.sqrMagnitude > 0.25f)
+                                        {
+                                            Vector3 vel = car.rb.velocity;
+                                            vel.y = 0f;
+                                            if (vel.sqrMagnitude > 0.25f)
+                                            {
+                                                int velSign = (Vector3.Dot(vel, tan) >= 0f) ? 1 : -1;
+                                                if (re.IsRightHandInDirection(velSign > 0))
+                                                    dirSign = velSign;
+                                            }
+                                        }
+                                        else if (isEligiblePlayer && playerQueueDir.sqrMagnitude > 0.01f)
+                                        {
+                                            float dotQ = Vector3.Dot(playerQueueDir, tan);
+                                            if (Mathf.Abs(dotQ) > 0.2f)
+                                            {
+                                                int qSign = (dotQ >= 0f) ? 1 : -1;
+                                                if (re.IsRightHandInDirection(qSign > 0))
+                                                    dirSign = qSign;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (dirSign == 0)
+                            {
+                                tainted.Add(trk);
+                                occupiedDirs.Remove(trk);
+                                continue;
+                            }
+
+                            int prevDir;
+                            if (occupiedDirs.TryGetValue(trk, out prevDir))
+                            {
+                                if (prevDir != dirSign)
+                                {
+                                    tainted.Add(trk);
+                                    occupiedDirs.Remove(trk);
+                                }
+                            }
+                            else
+                            {
+                                occupiedDirs[trk] = dirSign;
+                            }
+                        }
+                    }
+                }
+
+                if (graph != null)
+                {
+                    lock (graph._lock)
+                    {
+                        foreach (var kvp in graph._trackReservations)
+                        {
+                            RailTrack trk = kvp.Key;
+                            object holder = kvp.Value;
+                            if (trk == null || holder == null || tainted.Contains(trk))
+                                continue;
+                            if (ignoreRequester != null && object.ReferenceEquals(holder, ignoreRequester))
+                                continue;
+
+                            Dictionary<RailTrack, int> resPathDirs;
+                            int resDir;
+                            if (eligiblePathDirsByEng.TryGetValue(holder, out resPathDirs) &&
+                                resPathDirs.TryGetValue(trk, out resDir) &&
+                                resDir != 0)
+                            {
+                                reservedDirs[trk] = resDir;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
         private static void EnsureSuspendedTracksFrameCache()
         {
             int frame = Time.frameCount;
@@ -2609,6 +3104,45 @@ namespace AITraffic.Navigation
                 foreach (var kvp in _corridorTokenHolders)
                 {
                     if (kvp.Value == train)
+                    {
+                        keysToRemove.Add(kvp.Key);
+                    }
+                }
+
+                for (int i = 0; i < keysToRemove.Count; i++)
+                {
+                    string id = keysToRemove[i];
+                    _corridorTokenHolders.Remove(id);
+                    _corridorTokenAcquiredTime.Remove(id);
+
+                    var tracks = GetTracksForCorridor(id);
+                    if (tracks != null)
+                    {
+                        for (int t = 0; t < tracks.Count; t++)
+                        {
+                            if (tracks[t] != null)
+                            {
+                                ReleaseTrackReservation(tracks[t], train);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Releases all corridor tokens held by train except those in keepCorridorIds.
+        /// Used for immediate token teardown upon exiting a corridor into double-track, yards, sidings, or a new corridor.
+        /// </summary>
+        public void ReleaseAllCorridorTokensExcept(HashSet<string> keepCorridorIds, object train)
+        {
+            if (train == null) return;
+            lock (_corridorLock)
+            {
+                var keysToRemove = new List<string>();
+                foreach (var kvp in _corridorTokenHolders)
+                {
+                    if (kvp.Value == train && (keepCorridorIds == null || !keepCorridorIds.Contains(kvp.Key)))
                     {
                         keysToRemove.Add(kvp.Key);
                     }

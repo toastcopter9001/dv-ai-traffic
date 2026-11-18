@@ -289,11 +289,74 @@ MANDATORY_INVARIANTS = [
         "graveyard_ref": "GRAVEYARD.md Section 1 [AIE-19]"
     },
     {
+        "tag": "AIE-20",
+        "description": "TerminusStop must unconditionally release and never re-lock junctions or track reservations",
+        "expected_files": ["Driver/AIEngineer.cs"],
+        "min_count": 1,
+        "graveyard_ref": "GRAVEYARD.md Section 1 [AIE-20]"
+    },
+    {
         "tag": "RGR-11",
         "description": "Per-Train SignalBlockInfo Instance Isolation in CalculateUpcomingSignalBlocks",
         "expected_files": ["Navigation/SignalRegistry.cs"],
         "min_count": 1,
         "graveyard_ref": "GRAVEYARD.md Section 3 [RGR-11]"
+    },
+    {
+        "tag": "WRK-07",
+        "description": "Pre-Teardown Pro-Rated Cancellation Refund & Multi-Leg Intermediate Engine Preservation",
+        "expected_files": ["Workers/AtoBHaulTask.cs", "Workers/WorkerManager.cs", "Driver/AIEngineer.cs"],
+        "min_count": 3,
+        "graveyard_ref": "GRAVEYARD.md Section 5 [WRK-07]"
+    },
+    {
+        "tag": "WRK-08",
+        "description": "Valley-Wide Radio Dispatch, Pre-Switch Worker Hold, Async Blocked-Option Pre-Evaluation & E-Stop Max-Brake Lock",
+        "expected_files": ["Driver/AIEngineer.cs", "Workers/WorkerManager.cs"],
+        "min_count": 4,
+        "graveyard_ref": "GRAVEYARD.md Section 5 [WRK-08]"
+    },
+    {
+        "tag": "WRK-09",
+        "description": "In-Cab Co-Pilot Touch-to-Yield (PlayerCoPilotStandby), Servo Suppression, Configurable Hotkey & Physical Resource Stall Capping",
+        "expected_files": ["Driver/AIEngineer.cs", "Config/IniConfigManager.cs"],
+        "min_count": 5,
+        "graveyard_ref": "GRAVEYARD.md Section 5 [WRK-09]"
+    },
+    {
+        "tag": "SIG-CLS-1",
+        "description": "Combined Main/Entry Masts Must Never Be Demoted by SelfActsAsDistant",
+        "expected_files": ["Navigation/SignalRegistry.cs"],
+        "min_count": 1,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-CLS-1]"
+    },
+    {
+        "tag": "SIG-CLS-2",
+        "description": "Positive Sub-Distant-Aware IsDistantSignal Definition",
+        "expected_files": ["Navigation/SignalRegistry.cs"],
+        "min_count": 1,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-CLS-2]"
+    },
+    {
+        "tag": "SIG-CLS-3",
+        "description": "Type-Driven Main Signal Classification & Line-Speed Shunting Exclusion",
+        "expected_files": ["Navigation/SignalRegistry.cs"],
+        "min_count": 3,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-CLS-3]"
+    },
+    {
+        "tag": "SIG-IDX-1",
+        "description": "World-Load / Unload / Toggle Signal Index Invalidation & Bounded Rescan",
+        "expected_files": ["Navigation/SignalRegistry.cs", "Main.cs", "Core/TrafficManager.cs"],
+        "min_count": 6,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-IDX-1]"
+    },
+    {
+        "tag": "SIG-IDX-2",
+        "description": "Running-Head Signal Indexing from SignalManager.AllControllers",
+        "expected_files": ["Navigation/SignalRegistry.cs"],
+        "min_count": 2,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-IDX-2]"
     }
 ]
 
@@ -353,6 +416,18 @@ ANTI_PATTERNS = [
             "   Gate passing encounters with '&& _nextDispatchIsEncounter' instead."
         ),
         "graveyard_ref": "GRAVEYARD.md Section 5 [FLT-10]"
+    },
+    {
+        "name": "SelfActsAsDistant reference in C# code",
+        "regex": re.compile(r'\bSelfActsAsDistant\b'),
+        "allowed_files": [],
+        "message": (
+            "Checking Definition.SelfActsAsDistant in C# code is forbidden (SIG-CLS-1).\n"
+            "   In DVSignals this flag marks a combined Main/Entry mast that also shows distant indications;\n"
+            "   pure distant/repeater masts are identified positively via DistantSignalController,\n"
+            "   SignalType.Distant, SignalType.Repeater, and Signal.Parent != null."
+        ),
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-CLS-1]"
     }
 ]
 
@@ -1217,6 +1292,94 @@ def verify_v029_invariants(src_dir: Path) -> Tuple[bool, List[str]]:
     check_file("Workers/WorkerManager.cs",
                ["[WRK-06]", "MaxArrivalRouteChecks = 6", "originTrack.inJunction, originTrack.outJunction"],
                [], "WRK-06")
+
+    # WRK-07: AtoBHaulTask.cs, WorkerManager.cs, AIEngineer.cs
+    check_file("Workers/AtoBHaulTask.cs",
+               ["[WRK-07]", "public class ItineraryLeg", "WaitingAtIntermediate", "HasRemainingLegs"],
+               [], "WRK-07")
+    check_file("Workers/WorkerManager.cs",
+               ["[WRK-07]", "CalculateCancellationRefund(task)", "Inventory.Instance.AddMoney(refund)", "ShouldKeepEngineRunningOnArrival", "TryAdvanceToNextItineraryLeg"],
+               [], "WRK-07")
+    check_file("Driver/AIEngineer.cs",
+               ["[WRK-07]", "AssignNextItineraryLeg", "ShouldKeepEngineRunningOnArrival(this)"],
+               [], "WRK-07")
+
+    # WRK-09: AIEngineer.cs, IniConfigManager.cs, WorkerRadioStates.cs
+    check_file("Driver/AIEngineer.cs",
+               ["[WRK-09]", "PlayerCoPilotStandby", "ResumeAIDriving", "UpdatePlayerCoPilotHandover", "UpdateResourceConsumptionStallCapping", "Mathf.SmoothStep"],
+               [], "WRK-09")
+    check_file("Config/IniConfigManager.cs",
+               ["[WRK-09]", "CoPilotResumeHotkey", "IsCoPilotResumeHotkeyDown"],
+               [], "WRK-09")
+    check_file("Workers/Radio/WorkerRadioStates.cs",
+               ["RESUME AI DRIVING", "CO-PILOT"],
+               [], "WRK-09")
+
+    # WRK-10: AIEngineer.cs — restored approach-staging surface (property, backing field, six methods)
+    check_file("Driver/AIEngineer.cs",
+               ["public bool IsWorkerApproachStaging",
+                "private bool _isWorkerApproachStaging",
+                "AuditWorkerApproachCongestion",
+                "ClearWorkerApproachStaging",
+                "IsWorkerStagingTrackBlocked",
+                "GetWorkerStagingLiveStopDistance",
+                "ComputeWorkerStagingStopDistance",
+                "TryAdoptWorkerAlternateArrivalTrack"],
+               [], "WRK-10")
+
+    # WRK-GATE-1: both reservation gates carry the D-GATE disjunct exactly once (D2/Q4: Count == 0 stays unconditional)
+    target_aie = src_dir / "Driver/AIEngineer.cs"
+    if target_aie.exists():
+        with open(target_aie, "r", encoding="utf-8", errors="replace") as f:
+            aie_text = f.read()
+        gate_token = "(!_hasClearedOriginYard && SignalRegistry.RequiresRouteReservation("
+        cnt_gate = aie_text.count(gate_token)
+        if cnt_gate != 2:
+            err = f"{red('[FAIL]')} AIEngineer.cs has {cnt_gate} occurrences of the D-GATE disjunct (expected exactly 2) [WRK-GATE-1]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs gates A+B carry the D-GATE disjunct exactly 2x [WRK-GATE-1]")
+        if aie_text.count("_reservedDVSignals.Count == 0") < 2:
+            err = f"{red('[FAIL]')} AIEngineer.cs no longer keeps '_reservedDVSignals.Count == 0' unconditional in both gates [WRK-GATE-1]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs keeps '_reservedDVSignals.Count == 0' unconditional in both gates [WRK-GATE-1]")
+        if "[WRK-10]" not in aie_text:
+            err = f"{red('[FAIL]')} AIEngineer.cs carries no '[WRK-10]' CRITICAL INVARIANT tag [WRK-10]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs carries '[WRK-10]' CRITICAL INVARIANT tags [WRK-10]")
+        if "AccessTools.PropertyGetter(typeof(DV.Logic.Job.TrackID)" in aie_text:
+            err = f"{red('[FAIL]')} AIEngineer.cs reads TrackID via AccessTools.PropertyGetter (TrackID members are fields) [WRK-GATE-1]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs avoids AccessTools.PropertyGetter on TrackID [WRK-GATE-1]")
+        cnt_wrk10 = aie_text.count("[WRK-10]")
+        if cnt_wrk10 < 7:
+            err = f"{red('[FAIL]')} AIEngineer.cs has only {cnt_wrk10} '[WRK-10]' tags (expected >= 7: one per CS-1..CS-7 anchor) [WRK-10]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs tags every CS-1..CS-7 anchor ({cnt_wrk10} occurrences of '[WRK-10]') [WRK-10]")
+
+    # D4 TrackID field readers live in Pathfinder.cs (same reflection contract as [WRK-GATE-1])
+    check_file("Navigation/Pathfinder.cs",
+               ["CreateTrackIdFieldReader(\"trackType\")", "CreateTrackIdFieldReader(\"yardId\")", "s_trackTypeGetter(logicTrack.ID)", "s_trackYardIdGetter(logicTrack.ID)"],
+               ["AccessTools.PropertyGetter(typeof(DV.Logic.Job.TrackID)"], "WRK-GATE-1")
+
+    # WRK-GATE-2: Main.cs background-thread probe
+    check_file("Main.cs",
+               ["public static bool IsBackgroundThread"],
+               [], "WRK-GATE-2")
+
+    # WRK-GATE-3: SignalRegistry.cs balloon-loop detection (TrackBlock namespace + Initialize(force: false))
+    check_file("Navigation/SignalRegistry.cs",
+               ["using Signals.Game.Railway;", "Initialize(force: false)"],
+               ["EnsureInitialized()"], "WRK-GATE-3")
 
     # RGR-10: TrafficScheduler.cs
     target_sch = src_dir / "Core/TrafficScheduler.cs"

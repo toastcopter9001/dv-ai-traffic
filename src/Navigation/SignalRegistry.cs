@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using AITraffic.Compat;
 using DV.Simulation.Cars;
+using Signals.Game.Railway;
 using UnityEngine;
 using DVSignal = Signals.Game.Signal;
 
@@ -64,6 +65,19 @@ namespace AITraffic.Navigation
         private static readonly Dictionary<RailTrack, RailTrackBogiesOnTrack> s_bogiesCache = new Dictionary<RailTrack, RailTrackBogiesOnTrack>();
         private static bool s_isInitialized = false;
         private static float s_lastScanTime = 0f;
+
+        // CRITICAL INVARIANT [SIG-IDX-1]: world-load invalidation + bounded main-thread re-scan state.
+        // s_worldLoadTime < 0 means "no re-scan window armed"; MaybeRescan() is a no-op until ResetForWorldLoad(armRescan: true).
+        private static int s_indexedSignalCount = 0;
+        private static int s_skippedNoPlacement = 0;
+        private static int s_skippedNoTrack = 0;
+        private static float s_worldLoadTime = -1f;
+        private static bool s_rescan2sDone = false;
+        private static bool s_rescan15sDone = false;
+
+        // CRITICAL INVARIANT [SIG-RSV-1]: Bounded per-signal failure retry cooldown preventing per-tick DVSignals reservation storms.
+        private static readonly Dictionary<DVSignal, float> s_signalReserveCooldownUntil = new Dictionary<DVSignal, float>();
+        private const float SignalReserveFailureCooldownSec = 5.0f;
 
         private static RailTrackBogiesOnTrack GetBogiesOnTrack(RailTrack track)
         {
@@ -175,6 +189,17 @@ namespace AITraffic.Navigation
             try
             {
                 signal.Controller.RequestUpdate(2);
+                // CRITICAL INVARIANT [RGR-03]: Controller.Update(true, true) touches Unity objects and DVSignals
+                // block state and is main-thread only. Off-thread callers still flag the block dirty and request
+                // an update; the Unity Update loop performs the actual re-evaluation.
+                if (Main.IsBackgroundThread)
+                {
+                    if (signal.Block != null)
+                    {
+                        signal.Block.FlagAsDirty();
+                    }
+                    return;
+                }
                 if (signal.Block != null)
                 {
                     signal.Block.FlagAsDirty();
@@ -232,6 +257,139 @@ namespace AITraffic.Navigation
             catch { }
 
             return occupied;
+        }
+
+        private static readonly List<UpcomingSignal> s_playerSignalCheckScratch = new List<UpcomingSignal>(16);
+        private static readonly List<RailTrack> s_playerAheadTracksScratch = new List<RailTrack>(4);
+
+        /// <summary>
+        /// Main-thread only ([RGR-03]). Returns true when a stopped player trainset (&lt; 1.5 km/h) has a
+        /// governing red/stop aspect (DisallowPassing) signal within maxSignalDistance ahead along an active facing direction.
+        /// Used to distinguish a signal-queued player train from a parked/mid-block obstruction.
+        /// </summary>
+        public static bool IsPlayerTrainWaitingAtRedSignal(
+            Trainset playerTrainset,
+            float maxSignalDistance,
+            Vector3 expectedTravelDir,
+            out bool matchesExpectedDir,
+            out Vector3 matchedDirection)
+        {
+            matchesExpectedDir = false;
+            matchedDirection = Vector3.zero;
+            if (Main.IsBackgroundThread || playerTrainset == null || playerTrainset.cars == null || playerTrainset.cars.Count == 0 || !ModCompatManager.IsDVSignalsLoaded)
+                return false;
+
+            if (!s_isInitialized || s_trackSignals.Count == 0)
+            {
+                Initialize();
+            }
+
+            TrainCar refLoco = null;
+            if (PlayerManager.Car != null && PlayerManager.Car.trainset == playerTrainset && PlayerManager.Car.IsLoco)
+                refLoco = PlayerManager.Car;
+            else if (PlayerManager.LastLoco != null && PlayerManager.LastLoco.trainset == playerTrainset && PlayerManager.LastLoco.IsLoco)
+                refLoco = PlayerManager.LastLoco;
+            else
+            {
+                for (int i = 0; i < playerTrainset.cars.Count; i++)
+                {
+                    var c = playerTrainset.cars[i];
+                    if (c != null && c.IsLoco) { refLoco = c; break; }
+                }
+            }
+            if (refLoco == null)
+                refLoco = playerTrainset.cars[0];
+            if (refLoco == null)
+                return false;
+
+            // Check both ends (lead bogie forward and tail car opposite) so push-pull / mid-consist locomotives also resolve ahead signals cleanly.
+            for (int dirTry = 0; dirTry < 2; dirTry++)
+            {
+                TrainCar probeCar = (dirTry == 0) ? refLoco : playerTrainset.cars[playerTrainset.cars.Count - 1];
+                if (probeCar == null) continue;
+                Bogie probeBogie = (dirTry == 0) ? (probeCar.FrontBogie ?? probeCar.RearBogie) : (probeCar.RearBogie ?? probeCar.FrontBogie);
+                RailTrack trk = (probeBogie != null) ? probeBogie.track : null;
+                if (trk == null || trk.curve == null || probeBogie.traveller == null) continue;
+
+                double span = probeBogie.traveller.Span;
+                float len = trk.curve.length;
+                float t = (len > 0.01f) ? Mathf.Clamp01((float)(span / len)) : 0.5f;
+                Vector3 tan = trk.curve.GetTangentAt(t);
+                tan.y = 0f;
+                if (tan.sqrMagnitude < 0.0001f) continue;
+                tan.Normalize();
+
+                float travelDirSign;
+                if (expectedTravelDir.sqrMagnitude > 0.01f)
+                {
+                    float dotExp = Vector3.Dot(expectedTravelDir.normalized, tan);
+                    if (Mathf.Abs(dotExp) < 0.1f) continue;
+                    travelDirSign = (dotExp >= 0f) ? 1f : -1f;
+                }
+                else
+                {
+                    var graph = RailGraph.Instance;
+                    RailEdge re = (graph != null && graph.IsInitialized) ? graph.GetEdge(trk) : null;
+                    if (re != null && re.IsDoubleTrackMainline && re.ParallelEdge != null)
+                    {
+                        travelDirSign = re.IsRightHandInDirection(true) ? 1f : -1f;
+                    }
+                    else
+                    {
+                        travelDirSign = (Vector3.Dot(probeCar.transform.forward, tan) >= 0f) ? 1f : -1f;
+                    }
+                }
+
+                // Walk up to 2 aligned tracks ahead from probeCar so signals just past the current switch mast are visible.
+                s_playerAheadTracksScratch.Clear();
+                s_playerAheadTracksScratch.Add(trk);
+                RailTrack walkTrack = trk;
+                bool walkFwd = travelDirSign >= 0f;
+                for (int step = 0; step < 2; step++)
+                {
+                    Junction exitJunc = walkFwd ? walkTrack.outJunction : walkTrack.inJunction;
+                    RailTrack nextTrack = null;
+                    if (exitJunc != null)
+                    {
+                        if (exitJunc.inBranch != null && exitJunc.inBranch.track == walkTrack && exitJunc.outBranches != null &&
+                            exitJunc.selectedBranch >= 0 && exitJunc.selectedBranch < exitJunc.outBranches.Count)
+                        {
+                            nextTrack = exitJunc.outBranches[exitJunc.selectedBranch]?.track;
+                        }
+                        else if (exitJunc.inBranch != null && exitJunc.inBranch.track != walkTrack)
+                        {
+                            nextTrack = exitJunc.inBranch.track;
+                        }
+                    }
+                    if (nextTrack == null || nextTrack.curve == null || s_playerAheadTracksScratch.Contains(nextTrack)) break;
+                    Vector3 curExitPos = walkFwd ? walkTrack.curve.GetPointAt(1f) : walkTrack.curve.GetPointAt(0f);
+                    walkFwd = Vector3.Distance(curExitPos, nextTrack.curve.GetPointAt(0f)) <= Vector3.Distance(curExitPos, nextTrack.curve.GetPointAt(1f));
+                    s_playerAheadTracksScratch.Add(nextTrack);
+                    walkTrack = nextTrack;
+                }
+
+                s_playerSignalCheckScratch.Clear();
+                if (TryFindUpcomingSignals(trk, span, travelDirSign, s_playerAheadTracksScratch, s_playerSignalCheckScratch))
+                {
+                    for (int s = 0; s < s_playerSignalCheckScratch.Count; s++)
+                    {
+                        var us = s_playerSignalCheckScratch[s];
+                        if (us.Signal == null || us.Distance < 0f || us.Distance > maxSignalDistance) continue;
+                        var eff = us.Signal.Parent != null ? us.Signal.Parent : us.Signal;
+                        if (!IsGoverningSignal(eff)) continue;
+                        bool isRed = eff.IsOn && !eff.IsOff && eff.CurrentAspect != null && eff.CurrentAspect.DisallowPassing;
+                        if (isRed)
+                        {
+                            Vector3 worldDir = tan * travelDirSign;
+                            matchedDirection = worldDir;
+                            matchesExpectedDir = expectedTravelDir.sqrMagnitude > 0.01f && Vector3.Dot(expectedTravelDir.normalized, worldDir) > 0.2f;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
         }
 
         public static Vector3 GetPlayerPosition()
@@ -452,39 +610,41 @@ namespace AITraffic.Navigation
 
             s_trackSignals.Clear();
             s_lastScanTime = Time.time;
+            s_indexedSignalCount = 0;
+            s_skippedNoPlacement = 0;
+            s_skippedNoTrack = 0;
 
             try
             {
-                var lights = UnityEngine.Object.FindObjectsOfType<Signals.Game.Lights.SignalLight>();
-                if (lights != null)
+                // CRITICAL INVARIANT [SIG-IDX-2]: index ONLY running heads (Controller.Signals[]).
+                // ShuntingSignals[] (dwarf heads) and DisplaySignals[] (repeater plates, AllowReserving == false,
+                // Block == null) must never enter the index -- on combined Entry/Exit masts they share the parent Controller.Type.
+                bool indexedAny = false;
+                var signalManager = Signals.Game.SignalManager.Instance;
+                if (signalManager != null && signalManager.AllControllers != null)
                 {
-                    for (int i = 0; i < lights.Length; i++)
+                    List<Signals.Game.Controllers.BasicSignalController> controllers = signalManager.AllControllers;
+                    for (int c = 0; c < controllers.Count; c++)
                     {
-                        if (lights[i] == null) continue;
-                        var sig = lights[i].Signal;
-                        if (sig == null || sig.Controller == null || !sig.Controller.PlacementInfo.HasValue)
-                            continue;
-
-                        // If this light belongs to a sub-distant signal mounted on a parent main signal,
-                        // map it to the governing parent main signal!
-                        if (sig.Parent != null)
+                        var controller = controllers[c];
+                        if (controller == null || controller.Signals == null) continue;
+                        for (int i = 0; i < controller.Signals.Length; i++)
                         {
-                            sig = sig.Parent;
+                            if (IndexSignal(controller.Signals[i])) indexedAny = true;
                         }
+                    }
+                }
 
-                        var info = sig.Controller.PlacementInfo.Value;
-                        if (info.Track == null) continue;
-
-                        List<DVSignal> list;
-                        if (!s_trackSignals.TryGetValue(info.Track, out list))
+                // Fallback: SignalManager not populated yet -> legacy SignalLight sweep (guarded by IndexSignal).
+                if (!indexedAny)
+                {
+                    var lights = UnityEngine.Object.FindObjectsOfType<Signals.Game.Lights.SignalLight>();
+                    if (lights != null)
+                    {
+                        for (int i = 0; i < lights.Length; i++)
                         {
-                            list = new List<DVSignal>();
-                            s_trackSignals[info.Track] = list;
-                        }
-
-                        if (!list.Contains(sig))
-                        {
-                            list.Add(sig);
+                            if (lights[i] == null) continue;
+                            IndexSignal(lights[i].Signal);
                         }
                     }
                 }
@@ -493,8 +653,9 @@ namespace AITraffic.Navigation
 
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                 {
-                    int sigCount = lights != null ? lights.Length : 0;
-                    Main.ModEntry.Logger.Log(string.Format("[SignalRegistry] Indexed {0} signal lights across {1} tracks.", sigCount, s_trackSignals.Count));
+                    Main.ModEntry.Logger.Log(string.Format(
+                        "[SignalRegistry] Indexed {0} running heads across {1} tracks (skipped: {2} without placement, {3} without track).",
+                        s_indexedSignalCount, s_trackSignals.Count, s_skippedNoPlacement, s_skippedNoTrack));
                 }
             }
             catch (Exception ex)
@@ -503,6 +664,97 @@ namespace AITraffic.Navigation
                     Main.ModEntry.Logger.Warning(string.Format("[SignalRegistry] Error indexing signals: {0}", ex.Message));
             }
         }
+        /// <summary>
+        /// Adds one running signal head to the track index, mapping sub-heads from the legacy SignalLight fallback
+        /// to their parent mast while excluding ShuntingSignals[], DisplaySignals[], BufferStopSignalController,
+        /// and StaticSignalController before counting skips.
+        /// </summary>
+        // CRITICAL INVARIANT [SIG-IDX-2]: reject IsShunting, !AllowReserving, and placement-less BufferStop/Static controllers before counting skips.
+        private static bool IndexSignal(DVSignal sig)
+        {
+            if (sig == null) return false;
+
+            if (sig.Parent != null) sig = sig.Parent;
+            if (sig.IsShunting || !sig.AllowReserving) return false;
+
+            if (sig.Controller == null) return false;
+            if (sig.Controller is Signals.Game.Controllers.BufferStopSignalController ||
+                sig.Controller is Signals.Game.Controllers.StaticSignalController)
+            {
+                return false;
+            }
+            if (!sig.Controller.PlacementInfo.HasValue)
+            {
+                s_skippedNoPlacement++;
+                return false;
+            }
+
+            var info = sig.Controller.PlacementInfo.Value;
+            if (info.Track == null)
+            {
+                s_skippedNoTrack++;
+                return false;
+            }
+
+            List<DVSignal> list;
+            if (!s_trackSignals.TryGetValue(info.Track, out list))
+            {
+                list = new List<DVSignal>();
+                s_trackSignals[info.Track] = list;
+            }
+
+            if (list.Contains(sig)) return false;
+            list.Add(sig);
+            s_indexedSignalCount++;
+            return true;
+        }
+
+        /// <summary>
+        /// Invalidates the signal index on world load, toggle-on, or scene unload, and arms the bounded
+        /// main-thread re-scan window when armRescan is true (post-load TrackChecker shifts PlacementInfo.Span).
+        /// </summary>
+        // CRITICAL INVARIANT [SIG-IDX-1]: clear stale RailTrack/DVSignal references and optionally arm bounded 2s/15s rescan.
+        public static void ResetForWorldLoad(bool armRescan = true)
+        {
+            s_trackSignals.Clear();
+            s_bogiesCache.Clear();
+            s_signalReserveCooldownUntil.Clear();
+            s_isInitialized = false;
+            s_lastScanTime = 0f;
+            s_indexedSignalCount = 0;
+            s_skippedNoPlacement = 0;
+            s_skippedNoTrack = 0;
+            s_worldLoadTime = armRescan ? Time.time : -1f;
+            s_rescan2sDone = false;
+            s_rescan15sDone = false;
+        }
+
+        /// <summary>
+        /// Main-thread only. Re-indexes once at ~2s and once at ~15s after a world load so signals whose
+        /// placement data settles late are not permanently missing, then disarms the timer.
+        /// </summary>
+        public static void MaybeRescan()
+        {
+            // CRITICAL INVARIANT [RGR-03]: Unity object traversal / DVSignals scan is main-thread only.
+            if (Main.IsBackgroundThread) return;
+            if (s_worldLoadTime < 0f || s_rescan15sDone) return;
+
+            float elapsed = Time.time - s_worldLoadTime;
+            if (!s_rescan2sDone && elapsed >= 2f)
+            {
+                s_rescan2sDone = true;
+                Initialize(force: true);
+                return;
+            }
+            if (!s_rescan15sDone && elapsed >= 15f)
+            {
+                s_rescan15sDone = true;
+                s_worldLoadTime = -1f;
+                Initialize(force: true);
+            }
+        }
+
+
 
         public struct UpcomingSignal
         {
@@ -568,6 +820,7 @@ namespace AITraffic.Navigation
         {
             if (signal == null) return false;
             if (signal.Parent != null) return false; // Sub-distant repeater head mounted on main mast
+            if (!signal.AllowReserving || signal.IsShunting) return false;
 
             // 1. Controller type & flags from DVSignals
             if (signal.Controller != null)
@@ -579,6 +832,19 @@ namespace AITraffic.Navigation
                 if (signal.Controller is Signals.Game.Controllers.DistantSignalController)
                 {
                     return false;
+                }
+
+                // CRITICAL INVARIANT [SIG-CLS-3]: type precedence. A positively-typed running head is governing
+                // regardless of name/NameOverride/Definition. Standalone SignalType.Shunting dwarfs remain eligible
+                // below (for FindFirstGoverningSignal pass-2 fallback) while DisplaySignals/IsShunting are rejected above.
+                if (signal.Controller.Type == Signals.Game.SignalType.Mainline ||
+                    signal.Controller.Type == Signals.Game.SignalType.Entry ||
+                    signal.Controller.Type == Signals.Game.SignalType.Exit ||
+                    signal.Controller.Type == Signals.Game.SignalType.ExitPax ||
+                    signal.Controller.Type == Signals.Game.SignalType.ExitMainline ||
+                    signal.Controller.Type == Signals.Game.SignalType.Spacing)
+                {
+                    return true;
                 }
 
                 // NOTICE: Do NOT check signal.Controller.ActingAsDistant!
@@ -593,11 +859,10 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // 2. Do NOT exclude Definition.SelfActsAsDistant either: in DVSignals that flag marks a main signal that also
-            // displays the next signal's distant state itself ("In case this signal displays distant state by itself").
-            // It still owns a block and shows stop, and on the default layout most block, entry and exit signals are like
-            // this. Treating them as distant made the block model run past them, so a train reserved and locked through to
-            // the next "real" signal (e.g. from a double-track siding straight to the next station's entry signal).
+            // CRITICAL INVARIANT [SIG-CLS-1]: a mast flagged on its SignalDefinition as combining distant aspects
+            // with Main/Entry indications is NOT a pure distant signal. Pure distant and repeater masts are already
+            // rejected above via SignalType.Distant, SignalType.Repeater and DistantSignalController. Never demote
+            // station entry signals (e.g. OWC east 'A') via that definition flag -- doing so blocks reservation (Hp 0).
 
             // 3. Signal name / prefix (DVSignals German pack uses "Ps {0}" format for distant signals / Vorsignale)
             string sigName = signal.NameOverride ?? "";
@@ -628,26 +893,93 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
-        /// Checks whether a DVSignals signal is a pure distant signal (Vorsignal) or repeater.
+        /// Checks whether a DVSignals signal is a pure distant signal (Vorsignal), sub-distant board, or repeater.
         /// Pure distant signals do not command stops at their own mast, but give advance warning of downstream restrictions.
         /// </summary>
+        // CRITICAL INVARIANT [SIG-CLS-2]: positive, type-driven definition. Do NOT collapse to '!IsGoverningSignal'
+        // and do NOT normalize signal = signal.Parent first (Parent != null is Signal.DistantSignal, a mounted sub-distant head).
+        // Combined Main/Entry masts intentionally return false so AIEngineer.cs:2444 does not treat green Hp 1 + Vr 0
+        // as a red-signal stop; SpeedProfileGenerator.cs:829 handles Vr 0 braking directly.
         public static bool IsDistantSignal(DVSignal signal)
         {
-            return signal != null && !IsGoverningSignal(signal);
+            if (signal == null) return false;
+            if (signal.Parent != null) return true; // Signal.DistantSignal sub-head mounted on a parent mast
+
+            var ctrl = signal.Controller;
+            if (ctrl != null)
+            {
+                if (ctrl is Signals.Game.Controllers.DistantSignalController) return true;
+                if (ctrl.Type == Signals.Game.SignalType.Distant || ctrl.Type == Signals.Game.SignalType.Repeater) return true;
+                if (ctrl.Type == Signals.Game.SignalType.Mainline ||
+                    ctrl.Type == Signals.Game.SignalType.Entry ||
+                    ctrl.Type == Signals.Game.SignalType.Exit ||
+                    ctrl.Type == Signals.Game.SignalType.ExitPax ||
+                    ctrl.Type == Signals.Game.SignalType.ExitMainline ||
+                    ctrl.Type == Signals.Game.SignalType.Spacing ||
+                    ctrl.Type == Signals.Game.SignalType.Shunting)
+                {
+                    return false;
+                }
+
+                string ctrlName = ctrl.NameOverride ?? "";
+                if (ctrlName.StartsWith("Ps ", StringComparison.OrdinalIgnoreCase) ||
+                    ctrlName.StartsWith("Pp ", StringComparison.OrdinalIgnoreCase) ||
+                    ctrlName.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    ctrlName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            string sigName = signal.NameOverride ?? "";
+            if (sigName.StartsWith("Ps ", StringComparison.OrdinalIgnoreCase) ||
+                sigName.StartsWith("Pp ", StringComparison.OrdinalIgnoreCase) ||
+                sigName.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                sigName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return false;
         }
 
         /// <summary>
         /// Checks whether a DVSignals signal acts as a Main Signal (governs mainline block entry/exit).
-        /// Filters out shunting signals and distant repeaters.
+        /// Filters out shunting signals, non-reservable display plates, and distant repeaters.
         /// </summary>
+        // CRITICAL INVARIANT [SIG-CLS-3]: a main signal is any running head a train must obey as a mainline block boundary --
+        // Mainline, Entry, Exit, ExitPax, ExitMainline or Spacing. Requires AllowReserving && !IsShunting; Shunting dwarfs and
+        // pure Distant/Repeater heads are excluded. Never gate this back onto IsGoverningSignal alone.
         public static bool IsMainSignal(DVSignal signal)
         {
-            if (signal != null && signal.IsShunting) return false;
+            if (signal == null) return false;
+            if (signal.Parent != null) signal = signal.Parent;
+            if (!signal.AllowReserving || signal.IsShunting) return false;
+            var ctrl = signal.Controller;
+            if (ctrl != null)
+            {
+                if (ctrl is Signals.Game.Controllers.DistantSignalController) return false;
+                switch (ctrl.Type)
+                {
+                    case Signals.Game.SignalType.Mainline:
+                    case Signals.Game.SignalType.Entry:
+                    case Signals.Game.SignalType.Exit:
+                    case Signals.Game.SignalType.ExitPax:
+                    case Signals.Game.SignalType.ExitMainline:
+                    case Signals.Game.SignalType.Spacing:
+                        return true;
+                    case Signals.Game.SignalType.Shunting:
+                    case Signals.Game.SignalType.Distant:
+                    case Signals.Game.SignalType.Repeater:
+                        return false;
+                }
+            }
             return IsGoverningSignal(signal);
         }
 
         /// <summary>
         /// Finds the first governing home/main signal in the upcoming signals list, bypassing advance distant signals.
+        /// Prioritizes Main Signals over Dwarf/Shunt signals to prevent premature shunt-signal reservations.
         /// </summary>
         public static DVSignal FindFirstGoverningSignal(IList<UpcomingSignal> upcomingSignals, out float distance)
         {
@@ -658,10 +990,21 @@ namespace AITraffic.Navigation
                 var sigEntry = upcomingSignals[i];
                 if (sigEntry.Signal == null) continue;
                 var rawSig = sigEntry.Signal.Parent != null ? sigEntry.Signal.Parent : sigEntry.Signal;
-                if (IsGoverningSignal(rawSig))
+                if (IsGoverningSignal(rawSig) && IsMainSignal(rawSig))
                 {
                     distance = sigEntry.Distance;
                     return rawSig;
+                }
+            }
+            for (int j = 0; j < upcomingSignals.Count; j++)
+            {
+                var sigEntry2 = upcomingSignals[j];
+                if (sigEntry2.Signal == null) continue;
+                var rawSig2 = sigEntry2.Signal.Parent != null ? sigEntry2.Signal.Parent : sigEntry2.Signal;
+                if (IsGoverningSignal(rawSig2))
+                {
+                    distance = sigEntry2.Distance;
+                    return rawSig2;
                 }
             }
             return null;
@@ -780,12 +1123,11 @@ namespace AITraffic.Navigation
         /// capable of transitioning an AI movement from Slow Shunting Mode into full Line Speed.
         /// Filters out pure dwarf shunting signals (Sperrsignale) and distant repeaters (Vorsignale).
         /// </summary>
+        // CRITICAL INVARIANT [SIG-CLS-3]: only main running signals (never standalone SignalType.Shunting dwarfs
+        // or DisplaySignals) may transition an AI train out of Slow Shunting Mode into full Line Speed.
         public static bool IsLineSpeedAuthorizingSignal(DVSignal signal)
         {
-            if (signal == null) return false;
-            if (signal.Parent != null) signal = signal.Parent;
-            if (signal.IsShunting) return false;
-            return IsGoverningSignal(signal);
+            return IsMainSignal(signal);
         }
 
         /// <summary>
@@ -855,36 +1197,116 @@ namespace AITraffic.Navigation
             return false;
         }
 
+        private struct AspectPresentation
+        {
+            public readonly string DisplayName;
+            public readonly string ColorHex;
+            public readonly Color ColorValue;
+
+            public AspectPresentation(string displayName, string colorHex, Color colorValue)
+            {
+                DisplayName = displayName;
+                ColorHex = colorHex;
+                ColorValue = colorValue;
+            }
+        }
+
+        // CRITICAL INVARIANT [SIG-DSP-1]: Classify combined/distant expectation aspects (NEXT_STOP, RESTRICTED_NEXT_STOP, VR0, ExpectStop)
+        // when DisallowPassing == false BEFORE matching bare "STOP" tokens so passable amber indications never render as Hp 0 (Red / Stop).
+        private static AspectPresentation GetAspectPresentation(DVSignal signal)
+        {
+            if (signal == null)
+                return new AspectPresentation("Clear / Open Route", "#AAAAAA", new Color(0.7f, 0.7f, 0.7f));
+            if (signal.IsOff)
+                return new AspectPresentation("Off", "#AAAAAA", new Color(0.7f, 0.7f, 0.7f));
+            if (signal.CurrentAspect == null)
+                return new AspectPresentation("Off / Clear", "#AAAAAA", new Color(0.7f, 0.7f, 0.7f));
+
+            string id = signal.CurrentAspect.Id ?? string.Empty;
+            bool disallow = signal.CurrentAspect.DisallowPassing;
+
+            // Shunting stop / clear
+            if (id.IndexOf("SH0", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("SHUNTING_DISALLOWED", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return new AspectPresentation("Sh 0 (Red / Stop)", "#FF4444", new Color(1.0f, 0.25f, 0.25f));
+            }
+            if (id.IndexOf("SH1", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("WHITE", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                (!disallow && id.IndexOf("SHUNTING", StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                return new AspectPresentation("Sh 1 (White / Shunt)", "#E0E0FF", new Color(0.9f, 0.9f, 1.0f));
+            }
+
+            // Combined main+distant & pure distant expectation aspects (when mast itself is passable)
+            if (!disallow)
+            {
+                if (id.IndexOf("RESTRICTED_NEXT_STOP", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Hp 2+Vr 0 (Slow / Expect Stop)", "#FFA500", new Color(1.0f, 0.65f, 0.0f));
+
+                if (id.IndexOf("NEXT_STOP", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Hp 1+Vr 0 (Proceed / Expect Stop)", "#FFA500", new Color(1.0f, 0.65f, 0.0f));
+
+                if (id.IndexOf("RESTRICTED_NEXT_RESTRICTED", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Hp 2+Vr 2 (Slow / Expect Slow)", "#FFD700", new Color(1.0f, 0.85f, 0.1f));
+
+                if (id.IndexOf("NEXT_RESTRICTED", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Hp 1+Vr 2 (Proceed / Expect Slow)", "#FFD700", new Color(1.0f, 0.85f, 0.1f));
+
+                if (id.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    (id.IndexOf("EXPECT", StringComparison.OrdinalIgnoreCase) >= 0 && id.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    return new AspectPresentation("Vr 0 (Expect Stop)", "#FFA500", new Color(1.0f, 0.65f, 0.0f));
+                }
+
+                if (id.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    (id.IndexOf("EXPECT", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                     (id.IndexOf("RESTRICTED", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("SLOW", StringComparison.OrdinalIgnoreCase) >= 0)))
+                {
+                    return new AspectPresentation("Vr 2 (Expect Slow)", "#FFD700", new Color(1.0f, 0.85f, 0.1f));
+                }
+
+                if (id.IndexOf("VR1", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Vr 1 (Expect Clear)", "#00FF88", new Color(0.0f, 1.0f, 0.55f));
+            }
+
+            // Absolute stop aspects
+            if (disallow ||
+                id.IndexOf("HP0", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("AGAINST_PATH", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                string.Equals(id, "STOP", StringComparison.OrdinalIgnoreCase) ||
+                id.StartsWith("STOP_", StringComparison.OrdinalIgnoreCase))
+            {
+                return new AspectPresentation("Hp 0 (Red / Stop)", "#FF4444", new Color(1.0f, 0.25f, 0.25f));
+            }
+
+            // Slow / restricted aspects
+            if (id.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("RESTRICTED", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return new AspectPresentation("Hp 2 (Yellow / Slow)", "#FFD700", new Color(1.0f, 0.85f, 0.1f));
+            }
+
+            // Clear aspects
+            if (id.IndexOf("HP1", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("GREEN", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("CLEAR", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                string.Equals(id, "GO", StringComparison.OrdinalIgnoreCase))
+            {
+                return new AspectPresentation("Hp 1 (Green / Clear)", "#00FF88", new Color(0.0f, 1.0f, 0.55f));
+            }
+
+            return new AspectPresentation(id, "#FFFFFF", Color.white);
+        }
+
         /// <summary>
         /// Gets a clean display string for a signal's current aspect (e.g. "Hp 1 (Green)", "Hp 0 (Red)", "Hp 2 (Yellow)").
         /// </summary>
         public static string GetAspectDisplayName(DVSignal signal)
         {
-            if (signal == null) return "Clear / Open Route";
-            if (signal.IsOff) return "Off";
-            if (signal.CurrentAspect == null) return "Off / Clear";
-
-            string id = signal.CurrentAspect.Id ?? string.Empty;
-            bool disallow = signal.CurrentAspect.DisallowPassing;
-
-            if (disallow || id.IndexOf("HP0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Hp 0 (Red / Stop)";
-            if (id.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Hp 2 (Yellow / Slow)";
-            if (id.IndexOf("HP1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("GREEN", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CLEAR", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Hp 1 (Green / Clear)";
-            if (id.IndexOf("SH0", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Sh 0 (Red / Stop)";
-            if (id.IndexOf("SH1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("WHITE", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Sh 1 (White / Shunt)";
-            if (id.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Vr 0 (Expect Stop)";
-            if (id.IndexOf("VR1", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Vr 1 (Expect Clear)";
-            if (id.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Vr 2 (Expect Slow)";
-
-            return id;
+            return GetAspectPresentation(signal).DisplayName;
         }
 
         /// <summary>
@@ -892,21 +1314,7 @@ namespace AITraffic.Navigation
         /// </summary>
         public static string GetAspectColorHex(DVSignal signal)
         {
-            if (signal == null || signal.IsOff || signal.CurrentAspect == null) return "#AAAAAA";
-
-            string id = signal.CurrentAspect.Id ?? string.Empty;
-            bool disallow = signal.CurrentAspect.DisallowPassing;
-
-            if (disallow || id.IndexOf("HP0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("SH0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "#FF4444";
-            if (id.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "#FFD700";
-            if (id.IndexOf("HP1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("GREEN", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CLEAR", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR1", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "#00FF88";
-            if (id.IndexOf("SH1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("WHITE", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "#E0E0FF";
-
-            return "#FFFFFF";
+            return GetAspectPresentation(signal).ColorHex;
         }
 
         /// <summary>
@@ -914,21 +1322,7 @@ namespace AITraffic.Navigation
         /// </summary>
         public static Color GetAspectColor(DVSignal signal)
         {
-            if (signal == null || signal.IsOff || signal.CurrentAspect == null) return new Color(0.7f, 0.7f, 0.7f);
-
-            string id = signal.CurrentAspect.Id ?? string.Empty;
-            bool disallow = signal.CurrentAspect.DisallowPassing;
-
-            if (disallow || id.IndexOf("HP0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("SH0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0)
-                return new Color(1.0f, 0.25f, 0.25f);
-            if (id.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0)
-                return new Color(1.0f, 0.85f, 0.1f);
-            if (id.IndexOf("HP1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("GREEN", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CLEAR", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR1", StringComparison.OrdinalIgnoreCase) >= 0)
-                return new Color(0.0f, 1.0f, 0.55f);
-            if (id.IndexOf("SH1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("WHITE", StringComparison.OrdinalIgnoreCase) >= 0)
-                return new Color(0.9f, 0.9f, 1.0f);
-
-            return Color.white;
+            return GetAspectPresentation(signal).ColorValue;
         }
 
         /// <summary>
@@ -954,28 +1348,182 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Determines whether a signal guards or loops through a topological balloon/reverse loop.
+        /// When detected, route reservation via TrackReserver is bypassed to prevent self-locking Hp 0 deadlocks.
+        /// </summary>
+        public static bool IsBalloonLoopSignal(DVSignal signal)
+        {
+            if (signal == null)
+            {
+                return false;
+            }
+            var effSig = signal.Parent != null ? signal.Parent : signal;
+            TrackBlock trackBlock = effSig.Block ?? signal.Block;
+            if (trackBlock != null && trackBlock.IsSelfLoop)
+            {
+                return true;
+            }
+            RailTrack track;
+            double span;
+            if (!TryGetSignalPlacement(effSig, out track, out span) || track == null)
+            {
+                return false;
+            }
+            Initialize(force: false);
+            Junction guardedJunction = null;
+            if (effSig.Controller != null && effSig.Controller.PlacementInfo.HasValue)
+            {
+                var pInfo = effSig.Controller.PlacementInfo.Value;
+                guardedJunction = (pInfo.Direction == Signals.Game.TrackDirection.In) ? track.outJunction : track.inJunction;
+            }
+            if (guardedJunction == null)
+            {
+                guardedJunction = track.outJunction ?? track.inJunction;
+            }
+            if (guardedJunction == null)
+            {
+                return false;
+            }
+            RailTrack val = null;
+            if (guardedJunction.inBranch != null && guardedJunction.inBranch.track == track)
+            {
+                if (guardedJunction.outBranches != null && guardedJunction.selectedBranch >= 0 && guardedJunction.selectedBranch < guardedJunction.outBranches.Count)
+                {
+                    val = guardedJunction.outBranches[guardedJunction.selectedBranch]?.track;
+                }
+            }
+            else if (guardedJunction.inBranch != null)
+            {
+                val = guardedJunction.inBranch.track;
+            }
+            if (val == null)
+            {
+                return false;
+            }
+            HashSet<RailTrack> hashSet = new HashSet<RailTrack>();
+            RailTrack val2 = val;
+            Junction val3 = guardedJunction;
+            for (int i = 0; i < 6; i++)
+            {
+                if (val2 == null || !hashSet.Add(val2))
+                {
+                    break;
+                }
+                if (s_trackSignals.TryGetValue(val2, out var value) && value != null)
+                {
+                    for (int j = 0; j < value.Count; j++)
+                    {
+                        DVSignal signalInfo = value[j];
+                        if (signalInfo != null && signalInfo != effSig && signalInfo != signal && IsMainSignal(signalInfo))
+                        {
+                            return false;
+                        }
+                    }
+                }
+                Junction val4 = ((val2.inJunction == val3) ? val2.outJunction : val2.inJunction);
+                if (val4 == null)
+                {
+                    break;
+                }
+                if (val4 == guardedJunction)
+                {
+                    return true;
+                }
+                RailTrack val5 = null;
+                if (val4.inBranch != null && val4.inBranch.track == val2)
+                {
+                    if (val4.outBranches != null && val4.selectedBranch >= 0 && val4.selectedBranch < val4.outBranches.Count)
+                    {
+                        val5 = val4.outBranches[val4.selectedBranch]?.track;
+                    }
+                }
+                else if (val4.inBranch != null)
+                {
+                    val5 = val4.inBranch.track;
+                }
+                if (val5 == track)
+                {
+                    return true;
+                }
+                val3 = val4;
+                val2 = val5;
+            }
+            return false;
+        }
+
+        private static void RecordSignalReserveFailureCooldown(DVSignal signal)
+        {
+            if (signal == null) return;
+            float now = Time.time;
+            if (s_signalReserveCooldownUntil.Count > 256)
+            {
+                var expired = new List<DVSignal>();
+                foreach (var kvp in s_signalReserveCooldownUntil)
+                {
+                    if (kvp.Key == null || kvp.Value <= now)
+                        expired.Add(kvp.Key);
+                }
+                for (int i = 0; i < expired.Count; i++)
+                    s_signalReserveCooldownUntil.Remove(expired[i]);
+            }
+            s_signalReserveCooldownUntil[signal] = now + SignalReserveFailureCooldownSec;
+        }
+
+        public static void ClearSignalReserveCooldown(DVSignal signal)
+        {
+            if (signal == null) return;
+            if (signal.Parent != null) signal = signal.Parent;
+            s_signalReserveCooldownUntil.Remove(signal);
+        }
+
+        /// <summary>
         /// Attempts to reserve a DVSignal route via DVSignals TrackReserver.
         /// This satisfies SpecialRequireReservationAspect and turns station entry/exit signals from Hp 0 to Hp 1/Hp 2.
         /// </summary>
+        // CRITICAL INVARIANT [SIG-RSV-1]: Pre-check overlap and enforce per-signal cooldown on reservation failure to suppress per-tick warning storms.
         public static bool TryReserveDVSignal(DVSignal signal)
         {
             if (signal == null || !ModCompatManager.IsDVSignalsLoaded) return false;
             if (signal.Parent != null) signal = signal.Parent;
+            if (IsBalloonLoopSignal(signal))
+            {
+                ClearDVSignalReservation(signal);
+                return false;
+            }
             try
             {
                 bool reserved = Signals.Game.Railway.TrackReserver.HasReservation(signal);
                 if (!reserved)
                 {
+                    float cooldownUntil;
+                    if (s_signalReserveCooldownUntil.TryGetValue(signal, out cooldownUntil) && Time.time < cooldownUntil)
+                    {
+                        return false;
+                    }
+                    if (Signals.Game.Railway.TrackReserver.IsSignalReservedByAnother(signal))
+                    {
+                        RecordSignalReserveFailureCooldown(signal);
+                        return false;
+                    }
                     reserved = Signals.Game.Railway.TrackReserver.ReserveForSignal(signal);
+                    if (!reserved)
+                    {
+                        RecordSignalReserveFailureCooldown(signal);
+                    }
                 }
-                if (reserved && signal.Controller != null)
+                if (reserved)
                 {
-                    signal.Controller.RequestUpdate(1);
+                    s_signalReserveCooldownUntil.Remove(signal);
+                    if (signal.Controller != null)
+                    {
+                        signal.Controller.RequestUpdate(1);
+                    }
                 }
                 return reserved;
             }
             catch (Exception ex)
             {
+                RecordSignalReserveFailureCooldown(signal);
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Warning(string.Format("[SignalRegistry] Error reserving DVSignal '{0}': {1}", GetSignalName(signal), ex.Message));
                 return false;
@@ -989,6 +1537,7 @@ namespace AITraffic.Navigation
         {
             if (signal == null || !ModCompatManager.IsDVSignalsLoaded) return;
             if (signal.Parent != null) signal = signal.Parent;
+            s_signalReserveCooldownUntil.Remove(signal);
             try
             {
                 Signals.Game.Railway.TrackReserver.ClearFromSignal(signal);
@@ -1116,6 +1665,66 @@ namespace AITraffic.Navigation
                     }
                 }
             }
+            return false;
+        }
+
+        /// <summary>
+        /// Looks up the primary stopping signal (exit signal, shunting signal, or non-entry governing signal)
+        /// on a destination track facing the arriving train's direction of travel along that track.
+        /// Returns the first such signal encountered along the travel direction and its distance back from
+        /// the exit end of the destination track.
+        /// </summary>
+        public static bool TryGetDestinationStopSignal(RailTrack destTrack, bool forward, out DVSignal stopSignal, out float distFromTrackExit)
+        {
+            stopSignal = null;
+            distFromTrackExit = 0f;
+            if (destTrack == null || destTrack.curve == null || !ModCompatManager.IsDVSignalsLoaded) return false;
+
+            if (!s_isInitialized || s_trackSignals.Count == 0)
+            {
+                Initialize();
+            }
+
+            List<DVSignal> sigList;
+            if (!s_trackSignals.TryGetValue(destTrack, out sigList) || sigList == null || sigList.Count == 0)
+            {
+                return false;
+            }
+
+            float trackLen = destTrack.curve.length;
+            float dir = forward ? 1.0f : -1.0f;
+            float bestDistFromEntry = float.PositiveInfinity;
+
+            for (int i = 0; i < sigList.Count; i++)
+            {
+                var sig = sigList[i];
+                if (sig == null || sig.Controller == null || !sig.Controller.PlacementInfo.HasValue) continue;
+                if (!IsSignalFacingTrain(sig, dir)) continue;
+
+                var effSig = sig.Parent != null ? sig.Parent : sig;
+                if (IsEntrySignal(effSig)) continue;
+                bool isExitOrShunt = IsExitSignal(effSig) ||
+                                     (effSig.Controller != null && effSig.Controller.Type == Signals.Game.SignalType.Shunting) ||
+                                     IsGoverningSignal(effSig);
+                if (!isExitOrShunt) continue;
+
+                double sigSpan = sig.Controller.PlacementInfo.Value.Span;
+                float distFromEntry = forward ? (float)sigSpan : (trackLen - (float)sigSpan);
+                distFromEntry = Mathf.Clamp(distFromEntry, 0f, trackLen);
+
+                if (distFromEntry < bestDistFromEntry)
+                {
+                    bestDistFromEntry = distFromEntry;
+                    stopSignal = effSig;
+                }
+            }
+
+            if (stopSignal != null)
+            {
+                distFromTrackExit = Mathf.Max(0f, trackLen - bestDistFromEntry);
+                return true;
+            }
+
             return false;
         }
 
@@ -1465,7 +2074,7 @@ namespace AITraffic.Navigation
                     var sig = aheadSignals[i].Signal;
                     float dist = aheadSignals[i].Distance;
                     var effectiveSig = (sig != null && sig.Parent != null) ? sig.Parent : sig;
-                    if (IsGoverningSignal(effectiveSig))
+                    if (IsGoverningSignal(effectiveSig) && IsMainSignal(effectiveSig))
                     {
                         sig = effectiveSig;
                         if (currentBlock.BlockIndex == 1)
@@ -1581,7 +2190,7 @@ namespace AITraffic.Navigation
                             float sigDist = trackAheadSignals[i].Distance;
                             var effectiveSig = (sig != null && sig.Parent != null) ? sig.Parent : sig;
 
-                            if (IsGoverningSignal(effectiveSig))
+                            if (IsGoverningSignal(effectiveSig) && IsMainSignal(effectiveSig))
                             {
                                 sig = effectiveSig;
                                 currentBlock.ExitSignal = sig;

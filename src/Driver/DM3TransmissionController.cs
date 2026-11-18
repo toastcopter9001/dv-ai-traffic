@@ -69,10 +69,12 @@ namespace AITraffic.Driver
             _engineer = engineer;
             _trainCar = trainCar;
 
-            CurrentGearIndex = 0;
-            CurrentGearA = 0;
-            CurrentGearB = 0;
-            IsInNeutral = true;
+            // DV's DM3 gearbox has no Neutral notch (valid positions are 1..3 = 0.0 / 0.5 / 1.0);
+            // physical idle/neutral uses Reverser = 0 & Throttle = 0 with levers resting in A1-B1.
+            CurrentGearIndex = 1;
+            CurrentGearA = 1;
+            CurrentGearB = 1;
+            IsInNeutral = false;
 
             Initialize();
         }
@@ -125,12 +127,15 @@ namespace AITraffic.Driver
                     }
                 }
 
-                // Start in Neutral to prevent stalling at rest
-                ApplyGearsInstant(0, 0);
-                IsInNeutral = true;
+                // DV DM3 rests in lowest reduction A1-B1 (0.0f, 0.0f); engine/drivetrain neutral is via Reverser=0 & Throttle=0
+                ApplyGearsInstant(1, 1);
+                CurrentGearIndex = 1;
+                CurrentGearA = 1;
+                CurrentGearB = 1;
+                IsInNeutral = false;
 
                 if (Main.IsDebugLoggingEnabled)
-                    Main.LogDebug(string.Format("[DM3Transmission] Initialized DM3 loco '{0}' (PortA: {1}, PortB: {2}) in Neutral.", 
+                    Main.LogDebug(string.Format("[DM3Transmission] Initialized DM3 loco '{0}' (PortA: {1}, PortB: {2}) in A1-B1.",
                         ModCompatManager.GetCarId(_trainCar), _portGearboxA != null ? _portGearboxA.id : "null", _portGearboxB != null ? _portGearboxB.id : "null"));
             }
             catch (Exception ex)
@@ -142,6 +147,11 @@ namespace AITraffic.Driver
         public void Update(float dt)
         {
             if (!IsDM3 || _trainCar == null) return;
+
+            // CRITICAL INVARIANT [AIE-22]: halted forever once the train is parked. This is what stops the
+            // "shifts → throttle cut → brake → shift" cycle that was audible after the permanent-stall clamp, and it
+            // is the only thing that keeps a 0 km/h gearbox from upshifting out of gear 1 (UpshiftKmh == 0.0f).
+            if (_parked) return;
 
             // Lazy initialization retry (single-attempt latch)
             if (!_initialized && (_portGearboxA == null || _portGearboxB == null))
@@ -165,15 +175,17 @@ namespace AITraffic.Driver
 
             if (!isEngineOn)
             {
-                // Disengage transmission to Neutral so starter has zero load
-                if (!IsInNeutral)
+                // Seat gearbox in A1-B1 while restarting engine (Reverser=0 / Throttle=0 unloads DieselEngineDirectDrive)
+                if (IsShifting || IsInNeutral || CurrentGearIndex != 1 || CurrentGearA != 1 || CurrentGearB != 1)
                 {
-                    ApplyGearsInstant(0, 0);
-                    IsInNeutral = true;
-                    CurrentGearIndex = 0;
+                    ForceNeutral();
+                }
+                else
+                {
+                    EnsurePortsMatchCurrentGears();
                 }
 
-                // Restart engine in Neutral
+                // Restart engine in A1-B1 rest state
                 if (_restartCooldown <= 0.0f)
                 {
                     _restartCooldown = 2.0f;
@@ -189,19 +201,24 @@ namespace AITraffic.Driver
                 return;
             }
 
+            // Self-heal if prefab initialization order or SteppedJoint reset drifted ports away from current gear
+            EnsurePortsMatchCurrentGears();
+
             // 3. Speed & Target Analysis
             float speedKmh = _engineer != null ? _engineer.CurrentSpeedKmh : 0.0f;
             float targetKmh = _engineer != null ? _engineer.TargetSpeedKmh : 0.0f;
             float brakeAmt = _engineer != null ? _engineer.CurrentTrainBrake : 0.0f;
 
-            // 4. Neutral Management at Standstill / Braking (only when stopping)
+            // 4. Rest Gear (A1-B1) Management at Standstill / Braking (no dummy 0->1 shift needed on launch)
             if (targetKmh <= 0.5f || (targetKmh <= 1.0f && speedKmh < 1.5f && brakeAmt > 0.15f))
             {
-                if (!IsInNeutral && _shiftCooldown <= 0.0f)
+                if ((IsInNeutral || CurrentGearIndex != 1 || CurrentGearA != 1 || CurrentGearB != 1) && _shiftCooldown <= 0.0f)
                 {
-                    ApplyGearsInstant(0, 0);
-                    IsInNeutral = true;
-                    CurrentGearIndex = 0;
+                    ApplyGearsInstant(1, 1);
+                    CurrentGearIndex = 1;
+                    CurrentGearA = 1;
+                    CurrentGearB = 1;
+                    IsInNeutral = false;
                     _shiftCooldown = 0.5f;
                 }
                 return;
@@ -224,6 +241,15 @@ namespace AITraffic.Driver
 
             int current = CurrentGearIndex;
             if (current <= 0) current = 1;
+
+            // CRITICAL INVARIANT [AIE-21]: no gear change at a standstill. Gear 1 has UpshiftKmh == 0.0f, so
+            // `speedKmh >= curDef.UpshiftKmh` is trivially true at 0 km/h and the controller upshifts the moment the
+            // train stops — the mechanical half of the Issue 3 loop. Downshifting is likewise pointless while the
+            // wheels are not turning; the neutral-management branch above already covers a genuine stop.
+            if (speedKmh < 0.5f)
+            {
+                return current;
+            }
 
             // Cap maximum gear so the DM3 does not upshift beyond target line speed
             int maxAllowedGear = s_gearTable.Length;
@@ -311,15 +337,49 @@ namespace AITraffic.Driver
             }
         }
 
+        // CRITICAL INVARIANT [AIE-22]: a parked controller must never shift again. Set once by
+        // AIEngineer.SecureTrainForTerminalStop() and cleared only by AIEngineer.Resume().
+        private bool _parked = false;
+
+        public bool IsParked
+        {
+            get { return _parked; }
+        }
+
+        public void SetParked(bool parked)
+        {
+            _parked = parked;
+        }
+
+        private static float GearToNormalizedPortValue(int gear)
+        {
+            // DV DM3 ManualTransmissionInput has numOfGears = 3 with gear0IsNeutral = false and 3-notch SteppedJoint:
+            // Notch 0 (-35 deg) = Gear 1 -> 0.0f
+            // Notch 1 (  0 deg) = Gear 2 -> 0.5f (A2 / B2)
+            // Notch 2 (+35 deg) = Gear 3 -> 1.0f
+            int clamped = Mathf.Clamp(gear, 1, 3);
+            return (clamped - 1) * 0.5f;
+        }
+
+        private void EnsurePortsMatchCurrentGears()
+        {
+            int targetA = Mathf.Clamp(CurrentGearA, 1, 3);
+            int targetB = Mathf.Clamp(CurrentGearB, 1, 3);
+            float expectedA = GearToNormalizedPortValue(targetA);
+            float expectedB = GearToNormalizedPortValue(targetB);
+
+            bool desyncA = _portGearboxA != null && Mathf.Abs(_portGearboxA.Value - expectedA) > 0.08f;
+            bool desyncB = _portGearboxB != null && Mathf.Abs(_portGearboxB.Value - expectedB) > 0.08f;
+            if (desyncA || desyncB)
+            {
+                ApplyGearsInstant(targetA, targetB);
+            }
+        }
+
         public void ApplyGearsInstant(int gearA, int gearB)
         {
-            // Derail Valley ManualTransmissionInput uses a normalized 0.0 to 1.0 range:
-            // 0 = 0.0f (Neutral)
-            // 1 = 0.3333333f (Gear 1)
-            // 2 = 0.6666667f (Gear 2)
-            // 3 = 1.0f (Gear 3)
-            float valA = gearA <= 0 ? 0.0f : (gearA / 3.0f);
-            float valB = gearB <= 0 ? 0.0f : (gearB / 3.0f);
+            float valA = GearToNormalizedPortValue(gearA);
+            float valB = GearToNormalizedPortValue(gearB);
 
             if (_portGearboxA != null)
             {
@@ -330,6 +390,22 @@ namespace AITraffic.Driver
             {
                 _portGearboxB.Value = valB;
             }
+        }
+
+        // CRITICAL INVARIANT [AIE-22]: ApplyGearsInstant() writes the ports but never updates CurrentGearIndex /
+        // CurrentGearA / CurrentGearB / IsInNeutral, so every external caller leaves the controller lying about its
+        // physical state and the next Update re-shifts (the port-flap described in the scout report). This helper is
+        // the single, index-consistent rest/park state setter (seating DV's 3-notch gearbox into A1-B1 = 0.0f, 0.0f).
+        public void ForceNeutral()
+        {
+            ApplyGearsInstant(1, 1);
+            CurrentGearIndex = 1;
+            CurrentGearA = 1;
+            CurrentGearB = 1;
+            IsInNeutral = false;
+            IsShifting = false;
+            _shiftStep = 0;
+            _shiftCooldown = 0.0f;
         }
     }
 }

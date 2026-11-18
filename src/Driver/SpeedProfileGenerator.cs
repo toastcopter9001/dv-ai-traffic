@@ -21,7 +21,10 @@ namespace AITraffic.Driver
         SignalAspect,
         StationStop,
         BufferStop,
-        EmergencyStop
+        EmergencyStop,
+        ObstacleHold,
+        CorridorHold,
+        SwitchHold
     }
 
     /// <summary>
@@ -467,17 +470,26 @@ namespace AITraffic.Driver
         /// <returns>Allowable speed in m/s.</returns>
         public static float CalculateStopBrakingSpeed(float distanceToStop, float deceleration)
         {
-            // Within 4 meters of the mast / buffer stop: absolute halt
-            if (distanceToStop <= StopBufferDistance)
+            if (distanceToStop <= 3.0f)
             {
                 return 0.0f;
             }
 
-            // Final deceleration zone (4m to 12m): smoothly taper from 10 km/h down to 0 km/h
+            // Terminal crawl zone (<= 15m): maintain 5 km/h crawl down to 6m, then taper to 0 at 3m
+            if (distanceToStop <= 15.0f)
+            {
+                if (distanceToStop >= 6.0f)
+                {
+                    return KmHToMs(5.0f);
+                }
+                return KmHToMs(Mathf.Lerp(0.0f, 5.0f, (distanceToStop - 3.0f) / 3.0f));
+            }
+
+            // Final deceleration zone (15m to 40m): smoothly taper from CrawlSpeedKmh down to 5 km/h
             if (distanceToStop <= FinalDecelDistance)
             {
-                float t = Mathf.Clamp01((distanceToStop - StopBufferDistance) / (FinalDecelDistance - StopBufferDistance));
-                return KmHToMs(CrawlSpeedKmh * t);
+                float t = Mathf.Clamp01((distanceToStop - 15.0f) / (FinalDecelDistance - 15.0f));
+                return KmHToMs(Mathf.Lerp(5.0f, CrawlSpeedKmh, t));
             }
 
             // Crawl zone (12m to 75m): maintain steady 10 km/h crawl to bring the train right to the signal
@@ -714,7 +726,9 @@ namespace AITraffic.Driver
             float distanceToObstacle,
             float distanceToDestination,
             bool isStationStop,
-            bool isTerminusStop)
+            bool isTerminusStop,
+            float distanceToCorridorHold = float.PositiveInfinity,
+            float distanceToSwitchHold = float.PositiveInfinity)
         {
             SpeedProfileResult result = new SpeedProfileResult();
             result.TrackLimitKmh = MaxNetworkSpeedKmh;
@@ -876,25 +890,12 @@ namespace AITraffic.Driver
                 }
             }
 
-            // 4. Physical Track Occupancy Obstacle (Another train or player on the route ahead)
-            // Enforces strict absolute block separation: decelerates down to 0 km/h stop line before the obstacle/block boundary
+            // 4. Physical Track Occupancy Obstacle, Single-Track Corridor Hold & Unaligned Switch Hold
+            // Enforces strict absolute block separation while reporting the exact limiting hold category (reserving BufferStop for terminus stops).
             // CRITICAL INVARIANT [AIE-17]: Zero-Distance Obstacle Hold Enforcement (distanceToObstacle >= 0.0f)
-            if (distanceToObstacle >= 0.0f && distanceToObstacle < 2000.0f)
-            {
-                // Stop 45m behind obstacle ahead to guarantee ample buffer against rear-end collisions
-                float effectiveObstacleDist = Mathf.Max(0.0f, distanceToObstacle - 25.0f);
-                float obstacleDecel = Mathf.Max(ServiceDeceleration, 0.20f);
-                float obstacleStopSpeedMs = CalculateStopBrakingSpeed(effectiveObstacleDist, obstacleDecel);
-                float obstacleStopSpeedKmh = MsToKmH(obstacleStopSpeedMs);
-
-                if (obstacleStopSpeedKmh < finalTargetKmh)
-                {
-                    finalTargetKmh = obstacleStopSpeedKmh;
-                    result.StopLimitKmh = obstacleStopSpeedKmh;
-                    result.DistanceToStop = effectiveObstacleDist;
-                    result.LimitingReason = SpeedLimitReason.BufferStop;
-                }
-            }
+            ApplyHoldBrakingLimit(ref finalTargetKmh, ref result, distanceToObstacle, SpeedLimitReason.ObstacleHold);
+            ApplyHoldBrakingLimit(ref finalTargetKmh, ref result, distanceToCorridorHold, SpeedLimitReason.CorridorHold);
+            ApplyHoldBrakingLimit(ref finalTargetKmh, ref result, distanceToSwitchHold, SpeedLimitReason.SwitchHold);
 
             // 5. Destination / Buffer Stop / Station Platform Braking Curve
             if (distanceToDestination < 3000.0f)
@@ -927,6 +928,29 @@ namespace AITraffic.Driver
             result.TargetSpeedMs = KmHToMs(finalTargetKmh);
 
             return result;
+        }
+
+        private void ApplyHoldBrakingLimit(
+            ref float finalTargetKmh,
+            ref SpeedProfileResult result,
+            float holdDistance,
+            SpeedLimitReason reason)
+        {
+            if (holdDistance < 0.0f || holdDistance >= 2000.0f)
+                return;
+
+            float effectiveHoldDist = Mathf.Max(0.0f, holdDistance - 25.0f);
+            float holdDecel = Mathf.Max(ServiceDeceleration, 0.20f);
+            float holdStopSpeedMs = CalculateStopBrakingSpeed(effectiveHoldDist, holdDecel);
+            float holdStopSpeedKmh = MsToKmH(holdStopSpeedMs);
+
+            if (holdStopSpeedKmh < finalTargetKmh)
+            {
+                finalTargetKmh = holdStopSpeedKmh;
+                result.StopLimitKmh = holdStopSpeedKmh;
+                result.DistanceToStop = effectiveHoldDist;
+                result.LimitingReason = reason;
+            }
         }
 
         #endregion

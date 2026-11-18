@@ -16,6 +16,9 @@ namespace AITraffic
         public static bool Enabled { get; private set; }
         public static int MainThreadId { get; private set; }
 
+        // CRITICAL INVARIANT [WRK-GATE-2]: main-thread probe used by Pathfinder.IsFarmThroughTrack to skip the main-thread-only logic-track lookup (D5, from the Main.cs:66 idiom)
+        public static bool IsBackgroundThread => MainThreadId != 0 && System.Threading.Thread.CurrentThread.ManagedThreadId != MainThreadId;
+
         private static readonly object s_logLock = new object();
 
         // CRITICAL INVARIANT [LOG-01]: Build-aware diagnostic logging gate & background-thread-safe logger ([RGR-03]).
@@ -173,6 +176,12 @@ namespace AITraffic
                 RailGraph.Instance.Initialize();
                 TrafficScheduler.ClearCaches();
 
+                // CRITICAL INVARIANT [SIG-IDX-1]: the DVSignals index holds RailTrack references from the previous
+                // world. Without this reset Initialize() early-returns on a stale non-empty dictionary and NO signal
+                // is ever indexed again for the new world (every reservation gate then fails silently).
+                SignalRegistry.ResetForWorldLoad();
+                SignalRegistry.Initialize(force: true);
+
                 // Start Traffic Manager
                 TrafficManager.Instance.Settings = Settings;
                 TrafficManager.Instance.enabled = true;
@@ -219,6 +228,9 @@ namespace AITraffic
                     if (IsWorldFullyLoaded)
                     {
                         RailGraph.Instance.Initialize();
+                        // CRITICAL INVARIANT [SIG-IDX-1]: rebuild the signal index if the mod is re-enabled after scene unload or toggle-off.
+                        SignalRegistry.ResetForWorldLoad();
+                        SignalRegistry.Initialize(force: true);
                         TrafficManager.Instance.Settings = Settings;
                         TrafficManager.Instance.enabled = true;
                     }
